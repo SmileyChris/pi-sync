@@ -1,0 +1,19 @@
+{
+  "name": "pi-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "P2P sync for pi coding agent settings via Automerge CRDTs over Tailscale",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@automerge/automerge": "^3.0.0",
+    "@automerge/automerge-repo": "^2.5.5",
+    "@automerge/automerge-repo-network-websocket": "^2.5.4",
+    "@automerge/automerge-repo-storage-nodefs": "^2.5.6",
+    "ws": "^8.18.0"
+  }
+}
