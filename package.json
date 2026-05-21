@@ -6,6 +6,10 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
@@ -15,5 +19,8 @@
     "@automerge/automerge-repo-network-websocket": "^2.5.4",
     "@automerge/automerge-repo-storage-nodefs": "^2.5.6",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
   }
 }

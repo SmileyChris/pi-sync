@@ -7,9 +7,11 @@
  */
 
 export interface SyncedFile {
-  content: string;
+  content: string | { val: string };
   installedAt: number;
   source?: string;
+  deletedAt?: number;
+  deletedBy?: string;
 }
 
 export interface PiConfigDocument {
@@ -29,4 +31,5 @@ export interface SyncConfig {
   syncExtensions: boolean;
   syncSkills: boolean;
   syncModels: boolean;
+  syncPrompts: boolean;
 }

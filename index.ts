@@ -26,57 +26,46 @@
  *   /sync:local-only   – manage local-only files
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import {
+  type SyncedFile,
+  type PiConfigDocument,
+  type SyncConfig,
+  type Subdir,
+  DEFAULT_SYNC_CONFIG,
+  PI_DIR,
+  CONFIG_DIR,
+  CONFIG_PATH,
+  DOC_URL_PATH,
+  AM_STORAGE,
+  TRASH_DIR,
+  TOMBSTONE_TTL_MS,
+  MASS_DELETE_LIMIT,
+  normalizeFileKey,
+  fileKey,
+  getSubdir,
+  isLocalOnly,
+  shouldSync,
+  mergeSettingsIntoDoc,
+  unwrapContent,
+  syncedFileContentMatches,
+  loadConfig as loadConfigFromFile,
+  parsePeer,
+  peerHost,
+  collectExtensionFiles,
+  collectSkillFiles,
+  collectPromptFiles,
+  dirtyKeysFromPatches,
+  isTombstone,
+  isPastTTL,
+} from "./lib";
 
-// Types (no external imports needed at top level)
-export interface SyncedFile {
-  content: string;
-  installedAt: number;
-  source?: string;
-}
-
-export interface PiConfigDocument {
-  settings: Record<string, unknown>;
-  models: Record<string, unknown>;
-  extensions: Record<string, SyncedFile>;
-  skills: Record<string, SyncedFile>;
-  prompts: Record<string, SyncedFile>;
-  localOnly: Record<string, string[]>;
-  lastSync: Record<string, number>;
-}
-
-export interface SyncConfig {
-  port: number;
-  peers: string[];
-  syncSettings: boolean;
-  syncExtensions: boolean;
-  syncSkills: boolean;
-  syncModels: boolean;
-  syncPrompts: boolean;
-}
-
-const DEFAULT_SYNC_CONFIG: SyncConfig = {
-  port: 3030,
-  peers: [],
-  syncSettings: true,
-  syncExtensions: true,
-  syncSkills: true,
-  syncModels: true,
-  syncPrompts: true,
-};
-
-// Paths
-const home = os.homedir();
-const PI_DIR = path.join(home, ".pi", "agent");
-const CONFIG_DIR = path.join(home, ".config", "pi-sync");
-const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
-const DOC_URL_PATH = path.join(CONFIG_DIR, "doc-url");
-const AM_STORAGE = path.join(home, ".pi", "am-storage");
+export type { SyncedFile, PiConfigDocument, SyncConfig };
 
 // ── Module-level state ────────────────────────────────────────────────
 
@@ -94,15 +83,17 @@ const hostname = os.hostname();
 //  • tcpReachablePeers: peer port is open (best-effort via periodic TCP probe).
 const wsConnectedPeers = new Map<string, { since: number; direction: "in" | "out" }>();
 const tcpReachablePeers = new Set<string>();
-const clientAdapters = new Map<string, any>(); // peerHost → adapter
 
-// Export guard: prevent fs.watch from re-importing files while we're writing them
+// Export guard: prevent fs.watch from re-importing files we're writing
 let exporting = false;
+let suppressExportDepth = 0;
 
-// Debounce
 let pendingChanges = new Set<string>();
 let watchTimer: ReturnType<typeof setTimeout> | null = null;
+let widgetInterval: ReturnType<typeof setInterval> | null = null;
+let purgeInterval: ReturnType<typeof setInterval> | null = null;
 const WATCH_DEBOUNCE_MS = 500;
+const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
@@ -119,19 +110,19 @@ async function probePeer(host: string, port: number, timeoutMs = 2000): Promise<
   });
 }
 
-/** TCP-probe all configured peers (best-effort reachability check) */
+/** TCP-probe all configured peers in parallel (best-effort reachability). */
 async function probeAllPeers() {
-  for (const peer of config.peers) {
-    const [host, portStr] = peer.split(":");
-    const port = parseInt(portStr) || config.port;
-    if (host === hostname) continue;
-    const ok = await probePeer(host, port);
-    if (ok) {
-      tcpReachablePeers.add(host);
-    } else {
-      tcpReachablePeers.delete(host);
-    }
-  }
+  await Promise.allSettled(
+    config.peers.map(async (peer) => {
+      const parsed = parsePeer(peer);
+      const host = parsed?.host ?? peerHost(peer);
+      const port = parsed?.port ?? config.port;
+      if (host === hostname) return;
+      const ok = await probePeer(host, port);
+      if (ok) tcpReachablePeers.add(host);
+      else tcpReachablePeers.delete(host);
+    }),
+  );
 }
 
 let probeInterval: ReturnType<typeof setInterval> | null = null;
@@ -150,13 +141,82 @@ function ensureDir(dir: string) {
 }
 
 function loadConfig(): SyncConfig {
+  return loadConfigFromFile(CONFIG_PATH, fs.existsSync, fs.readFileSync as any);
+}
+
+function readEntries(dir: string) {
+  return fs.readdirSync(dir, { withFileTypes: true });
+}
+
+function readFileOrEmpty(p: string): string {
   try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-      return { ...DEFAULT_SYNC_CONFIG, ...raw };
-    }
-  } catch {}
-  return { ...DEFAULT_SYNC_CONFIG };
+    return fs.readFileSync(p, "utf-8");
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return "";
+    throw e;
+  }
+}
+
+function pathForFileKey(baseDir: string, rawKey: string): string | null {
+  const key = normalizeFileKey(rawKey);
+  if (!key) return null;
+  const root = path.resolve(baseDir);
+  const absPath = path.resolve(root, key);
+  return absPath.startsWith(root + path.sep) ? absPath : null;
+}
+
+function piPathForKey(fileKey: string): string | null {
+  return pathForFileKey(PI_DIR, fileKey);
+}
+
+function trashPathForKey(fileKey: string): string | null {
+  return pathForFileKey(TRASH_DIR, fileKey);
+}
+
+function withSuppressedExport<T>(fn: () => T): T {
+  suppressExportDepth++;
+  try {
+    return fn();
+  } finally {
+    suppressExportDepth--;
+  }
+}
+
+// ── Trash helpers ────────────────────────────────────────────────────
+
+function trashPathFor(fileKey: string): string | null {
+  return trashPathForKey(fileKey);
+}
+
+/** Move PI_DIR/<key> → TRASH_DIR/<key>. Overwrites any prior trash copy. */
+function moveToTrash(fileKey: string): boolean {
+  const src = piPathForKey(fileKey);
+  if (!src) return false;
+  if (!fs.existsSync(src)) return false;
+  const dest = trashPathFor(fileKey);
+  if (!dest) return false;
+  ensureDir(path.dirname(dest));
+  try { fs.rmSync(dest, { force: true, recursive: true }); } catch {}
+  fs.renameSync(src, dest);
+  return true;
+}
+
+/** Move TRASH_DIR/<key> → PI_DIR/<key>. */
+function restoreFromTrash(fileKey: string): boolean {
+  const src = trashPathFor(fileKey);
+  if (!src) return false;
+  if (!fs.existsSync(src)) return false;
+  const dest = piPathForKey(fileKey);
+  if (!dest) return false;
+  ensureDir(path.dirname(dest));
+  fs.renameSync(src, dest);
+  return true;
+}
+
+function purgeFromTrash(fileKey: string) {
+  const trashPath = trashPathFor(fileKey);
+  if (!trashPath) return;
+  try { fs.rmSync(trashPath, { force: true }); } catch {}
 }
 
 function saveDocUrl(url: string) {
@@ -179,180 +239,76 @@ function clearDocUrl() {
   } catch {}
 }
 
-function fileKey(filePath: string): string {
-  return path.relative(PI_DIR, filePath);
-}
-
-function getSubdir(fileKey: string): string | null {
-  if (fileKey === "settings.json") return "settings";
-  if (fileKey === "models.json") return "models";
-  if (fileKey.startsWith("extensions/") || fileKey.startsWith("extensions\\")) return "extensions";
-  if (fileKey.startsWith("skills/") || fileKey.startsWith("skills\\")) return "skills";
-  if (fileKey.startsWith("prompts/") || fileKey.startsWith("prompts\\")) return "prompts";
-  return null;
-}
-
-function isLocalOnlyByMap(
-  localOnly: Record<string, string[]>,
-  fileKey: string,
-): boolean {
-  const allowed = localOnly[fileKey];
-  if (!allowed) return false;
-  return !allowed.includes(hostname);
-}
-
-function isLocalOnly(doc: PiConfigDocument | undefined, fileKey: string): boolean {
-  if (!doc) return false;
-  return isLocalOnlyByMap(doc.localOnly, fileKey);
-}
-
 // ── Import: filesystem → document ─────────────────────────────────────
 
-function importFile(doc: PiConfigDocument, fileKey: string): boolean {
-  const absPath = path.join(PI_DIR, fileKey);
-  if (!fs.existsSync(absPath)) return false;
-  const content = fs.readFileSync(absPath, "utf-8");
-  const subdir = getSubdir(fileKey);
-  if (!subdir) return false;
-
-  if (isLocalOnlyByMap(doc.localOnly, fileKey)) return false;
-
-  if (subdir === "settings") {
-    try {
-      const parsed = JSON.parse(content);
-      // Per-key merge to preserve CRDT semantics — avoids whole-object
-      // replacement which would lose concurrent changes to other keys.
-      const existing = doc.settings || {};
-      let hasDiff = false;
-      for (const [k, v] of Object.entries(parsed)) {
-        if (JSON.stringify(existing[k]) !== JSON.stringify(v)) { hasDiff = true; break; }
-      }
-      // Also check for removed keys
-      for (const k of Object.keys(existing)) {
-        if (!(k in parsed)) { hasDiff = true; break; }
-      }
-      if (!hasDiff) return false;
-      // Remove keys no longer present, then set all current keys
-      for (const k of Object.keys(existing)) {
-        if (!(k in parsed)) delete doc.settings[k];
-      }
-      for (const [k, v] of Object.entries(parsed)) {
-        doc.settings[k] = v;
-      }
-      return true;
-    } catch { return false; }
+/** Apply mergeSettingsIntoDoc result in place on the Automerge proxy.
+ *  Keeps per-key writes so the CRDT preserves concurrent edits. */
+function applyJsonMergeInPlace(
+  target: Record<string, unknown>,
+  fileContent: string,
+): boolean {
+  const merged = mergeSettingsIntoDoc(target, fileContent);
+  if (!merged) return false;
+  for (const k of Object.keys(target)) {
+    if (!(k in merged)) delete target[k];
   }
-  if (subdir === "models") {
-    try {
-      const parsed = JSON.parse(content);
-      const existing = doc.models || {};
-      let hasDiff = false;
-      for (const [k, v] of Object.entries(parsed)) {
-        if (JSON.stringify(existing[k]) !== JSON.stringify(v)) { hasDiff = true; break; }
-      }
-      for (const k of Object.keys(existing)) {
-        if (!(k in parsed)) { hasDiff = true; break; }
-      }
-      if (!hasDiff) return false;
-      for (const k of Object.keys(existing)) {
-        if (!(k in parsed)) delete doc.models[k];
-      }
-      for (const [k, v] of Object.entries(parsed)) {
-        doc.models[k] = v;
-      }
-      return true;
-    } catch { return false; }
+  for (const [k, v] of Object.entries(merged)) {
+    target[k] = v;
   }
-  if (subdir === "extensions" || subdir === "skills" || subdir === "prompts") {
-    const collection = doc[subdir] as Record<string, SyncedFile>;
-    const existing = collection[fileKey];
-
-    // ImmutableString unwrap: doc proxy may return ImmutableString { val }
-    const existingContent = typeof existing?.content === 'string'
-      ? existing.content
-      : (existing?.content?.val ?? null);
-    if (existingContent === content) return false;
-
-    const entry: SyncedFile = {
-      content: ImmutableString ? new ImmutableString(content) : content,
-      installedAt: existing?.installedAt ?? Date.now(),
-    };
-    if (existing?.source) entry.source = existing.source;
-    collection[fileKey] = entry;
-    return true;
-  }
-  return false;
+  return true;
 }
 
-/** Collect all files that need importing, returns array of fileKeys */
+function importFile(doc: PiConfigDocument, fileKey: string): boolean {
+  const key = normalizeFileKey(fileKey);
+  if (!key) return false;
+  const subdir = getSubdir(key);
+  if (!subdir) return false;
+  if (!shouldSync(key, config)) return false;
+  if (isLocalOnly(doc, key, hostname)) return false;
+
+  const absPath = piPathForKey(key);
+  if (!absPath) return false;
+  if (!fs.existsSync(absPath)) return false;
+  const content = fs.readFileSync(absPath, "utf-8");
+
+  if (subdir === "settings" || subdir === "models") {
+    return applyJsonMergeInPlace(doc[subdir], content);
+  }
+
+  // extensions | skills | prompts
+  const collection = doc[subdir] as Record<string, SyncedFile>;
+  const existing = collection[key];
+  if (syncedFileContentMatches(existing, content)) return false;
+
+  const entry: SyncedFile = {
+    content: ImmutableString ? new ImmutableString(content) : content,
+    installedAt: existing?.installedAt ?? Date.now(),
+  };
+  if (existing?.source) entry.source = existing.source;
+  collection[key] = entry;
+  return true;
+}
+
+/** Collect all sync-eligible files under PI_DIR, returns fileKeys. */
 function collectAllFiles(): string[] {
   const files: string[] = [];
 
-  // Settings & models
   if (config.syncSettings && fs.existsSync(path.join(PI_DIR, "settings.json")))
     files.push("settings.json");
   if (config.syncModels && fs.existsSync(path.join(PI_DIR, "models.json")))
     files.push("models.json");
 
-  // Extensions — sync code + assets (skip pi-sync itself; it's local-only)
-  if (config.syncExtensions) {
-    const extDir = path.join(PI_DIR, "extensions");
-    if (fs.existsSync(extDir)) {
-      const walk = (dir: string) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory() && entry.name !== "pi-sync" && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
-            walk(fullPath);
-          } else if (
-            entry.name.endsWith(".ts") || entry.name.endsWith(".js") ||
-            entry.name.endsWith(".css") || entry.name.endsWith(".json") ||
-            entry.name.endsWith(".wasm") || entry.name.endsWith(".html") ||
-            entry.name.endsWith(".svg") || entry.name.endsWith(".png") ||
-            entry.name.endsWith(".jpg") || entry.name.endsWith(".woff2") ||
-            entry.name.endsWith(".md")
-          ) {
-            files.push(fileKey(fullPath));
-          }
-        }
-      };
-      walk(extDir);
-    }
+  const extDir = path.join(PI_DIR, "extensions");
+  if (config.syncExtensions && fs.existsSync(extDir)) {
+    files.push(...collectExtensionFiles(extDir, readEntries));
   }
-
-  // Skills
-  if (config.syncSkills) {
-    const skillsDir = path.join(PI_DIR, "skills");
-    if (fs.existsSync(skillsDir)) {
-      const walk = (dir: string) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
-            walk(fullPath);
-          } else if (entry.name === "SKILL.md" || entry.name.endsWith(".md")) {
-            files.push(fileKey(fullPath));
-          }
-        }
-      };
-      walk(skillsDir);
-    }
+  const skillsDir = path.join(PI_DIR, "skills");
+  if (config.syncSkills && fs.existsSync(skillsDir)) {
+    files.push(...collectSkillFiles(skillsDir, readEntries));
   }
-
-  // Prompts
-  if (config.syncPrompts) {
-    const promptsDir = path.join(PI_DIR, "prompts");
-    if (fs.existsSync(promptsDir)) {
-      const walk = (dir: string) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")) {
-            walk(fullPath);
-          } else if (entry.name.endsWith(".md") || entry.name.endsWith(".txt")) {
-            files.push(fileKey(fullPath));
-          }
-        }
-      };
-      walk(promptsDir);
-    }
+  const promptsDir = path.join(PI_DIR, "prompts");
+  if (config.syncPrompts && fs.existsSync(promptsDir)) {
+    files.push(...collectPromptFiles(promptsDir, readEntries));
   }
 
   return files;
@@ -369,92 +325,83 @@ function importAllFiles(doc: PiConfigDocument): boolean {
 // ── Export: document → filesystem ─────────────────────────────────────
 
 function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
-  if (isLocalOnly(doc, fileKey)) return false;
-
-  const absPath = path.join(PI_DIR, fileKey);
-  const subdir = getSubdir(fileKey);
+  const key = normalizeFileKey(fileKey);
+  if (!key) return false;
+  if (isLocalOnly(doc, key, hostname)) return false;
+  const subdir = getSubdir(key);
   if (!subdir) return false;
+  if (!shouldSync(key, config)) return false;
 
-  if (subdir === "settings") {
-    if (!config.syncSettings) return false;
-    const content = JSON.stringify(doc.settings, null, 2) + "\n";
-    const existing = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-    if (existing === content) return false;
+  const absPath = piPathForKey(key);
+  if (!absPath) return false;
+
+  if (subdir === "settings" || subdir === "models") {
+    const content = JSON.stringify(doc[subdir], null, 2) + "\n";
+    if (readFileOrEmpty(absPath) === content) return false;
     ensureDir(path.dirname(absPath));
     fs.writeFileSync(absPath, content);
     return true;
   }
 
-  if (subdir === "models") {
-    if (!config.syncModels) return false;
-    const content = JSON.stringify(doc.models, null, 2) + "\n";
-    const existing = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-    if (existing === content) return false;
-    ensureDir(path.dirname(absPath));
-    fs.writeFileSync(absPath, content);
-    return true;
+  const collection = doc[subdir] as Record<string, SyncedFile>;
+  const synced = collection[fileKey] ?? collection[key];
+  if (!synced) return false;
+
+  if (isTombstone(synced)) {
+    // Remote peer (or a previous local action) tombstoned this entry.
+    // Move our copy to the trash dir; the entry stays in the doc until
+    // TTL purge or explicit /sync:trash empty.
+    if (fs.existsSync(absPath)) {
+      moveToTrash(key);
+      return true;
+    }
+    return false;
   }
 
-  if (subdir === "extensions" || subdir === "skills" || subdir === "prompts") {
-    if (subdir === "extensions" && !config.syncExtensions) return false;
-    if (subdir === "skills" && !config.syncSkills) return false;
-    if (subdir === "prompts" && !config.syncPrompts) return false;
-
-    const collection = doc[subdir] as Record<string, SyncedFile>;
-    const synced = collection[fileKey];
-    if (!synced) return false;
-
-    // Unwrap ImmutableString: doc proxy may return { val: "..." }
-    const syncedContent = typeof synced.content === 'string'
-      ? synced.content
-      : (synced.content?.val ?? "");
-
-    const existing = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf-8") : "";
-    if (existing === syncedContent) return false;
-
-    ensureDir(path.dirname(absPath));
-    fs.writeFileSync(absPath, syncedContent);
-    return true;
-  }
-
-  return false;
+  const content = unwrapContent(synced) ?? "";
+  if (readFileOrEmpty(absPath) === content) return false;
+  ensureDir(path.dirname(absPath));
+  fs.writeFileSync(absPath, content);
+  return true;
 }
 
-function exportAllFiles(doc: PiConfigDocument): boolean {
-  // Guard: prevent watcher from re-importing files we're writing now
+/** Treat the doc as uninitialized if it has no synced content yet.
+ *  Writing the empty shape to disk on first run would wipe local files. */
+function isDocEmpty(doc: PiConfigDocument): boolean {
+  return (
+    Object.keys(doc.extensions).length === 0 &&
+    Object.keys(doc.skills).length === 0 &&
+    Object.keys(doc.prompts).length === 0 &&
+    Object.keys(doc.settings).length === 0 &&
+    Object.keys(doc.models).length === 0
+  );
+}
+
+function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
   exporting = true;
   try {
-    // Safety: don't export from a seemingly empty/uninitialized document
-    const extCount = Object.keys(doc.extensions).length;
-    const skillCount = Object.keys(doc.skills).length;
-    const settingCount = Object.keys(doc.settings).length;
-    if (extCount === 0 && skillCount === 0 && settingCount === 0) {
-      console.log("[pi-sync] Skipping export: document appears empty (first sync?)");
-      return false;
-    }
     let changed = false;
-    if (exportFile(doc, "settings.json")) changed = true;
-    if (exportFile(doc, "models.json")) changed = true;
-
-    if (config.syncExtensions) {
-      for (const key of Object.keys(doc.extensions)) {
-        if (exportFile(doc, key)) changed = true;
-      }
-    }
-    if (config.syncSkills) {
-      for (const key of Object.keys(doc.skills)) {
-        if (exportFile(doc, key)) changed = true;
-      }
-    }
-    if (config.syncPrompts) {
-      for (const key of Object.keys(doc.prompts)) {
-        if (exportFile(doc, key)) changed = true;
-      }
+    for (const key of keys) {
+      if (exportFile(doc, key)) changed = true;
     }
     return changed;
   } finally {
     exporting = false;
   }
+}
+
+function exportAllFiles(doc: PiConfigDocument): boolean {
+  if (isDocEmpty(doc)) {
+    console.log("[pi-sync] Skipping export: document appears empty (first sync?)");
+    return false;
+  }
+  return exportKeys(doc, [
+    "settings.json",
+    "models.json",
+    ...Object.keys(doc.extensions),
+    ...Object.keys(doc.skills),
+    ...Object.keys(doc.prompts),
+  ]);
 }
 
 // ── Watcher ───────────────────────────────────────────────────────────
@@ -469,10 +416,57 @@ async function flushPendingChanges() {
   const currentDoc = await handle.doc?.();
   if (!currentDoc) return;
 
-  handle.change?.((doc: PiConfigDocument) => {
-    for (const fileKey of files) {
-      importFile(doc, fileKey);
+  // Partition into present (add/update) vs missing (potential delete).
+  // A "missing" key only counts as a delete if the doc still has a LIVE
+  // entry — re-deletion of an already-tombstoned entry is a no-op.
+  const present: string[] = [];
+  const deletions: string[] = [];
+  for (const rawKey of files) {
+    const key = normalizeFileKey(rawKey);
+    if (!key || !shouldSync(key, config)) continue;
+    const absPath = piPathForKey(key);
+    if (!absPath) continue;
+    if (fs.existsSync(absPath)) {
+      present.push(key);
+      continue;
     }
+    const subdir = getSubdir(key);
+    // Only collection sections are tombstoneable. Settings/models are
+    // whole-file JSON; their absence is treated as "no changes" so peers
+    // don't propagate transient deletions of those files.
+    if (subdir !== "extensions" && subdir !== "skills" && subdir !== "prompts") continue;
+    const collection = currentDoc[subdir] as Record<string, SyncedFile>;
+    const entry = collection?.[key];
+    if (entry && !isTombstone(entry)) deletions.push(key);
+  }
+
+  // Mass-delete brake: refuse to propagate large bursts. The user likely
+  // ran `rm -rf` / `git clean` / similar — better to require them to
+  // resurrect on disk (or use /sync:trash empty per file) than silently
+  // wipe the cluster.
+  let blockedDeletions = false;
+  if (deletions.length > MASS_DELETE_LIMIT) {
+    console.error(
+      `[pi-sync] Mass-delete brake: ${deletions.length} files vanished in one flush ` +
+      `(limit ${MASS_DELETE_LIMIT}). Holding tombstones. Restore the files on disk ` +
+      `to dismiss, or run \`/sync:trash empty <path>\` per file to confirm.`,
+    );
+    blockedDeletions = true;
+  }
+
+  withSuppressedExport(() => {
+    handle.change?.((doc: PiConfigDocument) => {
+      for (const key of present) importFile(doc, key);
+      if (blockedDeletions) return;
+      for (const key of deletions) {
+        const subdir = getSubdir(key) as "extensions" | "skills" | "prompts";
+        const collection = doc[subdir] as Record<string, SyncedFile>;
+        const entry = collection[key];
+        if (!entry) continue;
+        entry.deletedAt = Date.now();
+        entry.deletedBy = hostname;
+      }
+    });
   });
 }
 
@@ -489,10 +483,12 @@ function startFileWatcher() {
         filename.startsWith("git/") ||
         filename === "auth.json" ||
         filename.startsWith("am-storage") ||
+        filename.startsWith(".trash") ||
         filename.startsWith(".obgo")
       ) return;
 
-      const key = fileKey(path.join(PI_DIR, filename));
+      const key = normalizeFileKey(fileKey(path.join(PI_DIR, filename)));
+      if (!key || !shouldSync(key, config)) return;
       const subdir = getSubdir(key);
       if (!subdir) return;
 
@@ -510,11 +506,51 @@ function stopFileWatcher() {
   if (watcher) { watcher.close(); watcher = null; }
 }
 
+// ── Tombstone TTL purge ──────────────────────────────────────────────
+
+/** Find and hard-delete tombstones older than TOMBSTONE_TTL_MS. Trash
+ *  files for those entries are removed too. Returns count purged. */
+async function purgePastTTL(): Promise<number> {
+  if (!handle) return 0;
+  const doc = await handle.doc?.();
+  if (!doc) return 0;
+  const now = Date.now();
+  type Hit = { section: "extensions" | "skills" | "prompts"; key: string };
+  const purgeable: Hit[] = [];
+  for (const section of ["extensions", "skills", "prompts"] as const) {
+    const col = doc[section] as Record<string, SyncedFile>;
+    for (const [key, entry] of Object.entries(col)) {
+      if (isPastTTL(entry, now)) purgeable.push({ section, key });
+    }
+  }
+  if (purgeable.length === 0) return 0;
+  handle.change?.((d: PiConfigDocument) => {
+    for (const p of purgeable) {
+      const col = d[p.section] as Record<string, SyncedFile>;
+      delete col[p.key];
+    }
+  });
+  for (const p of purgeable) purgeFromTrash(p.key);
+  console.log(`[pi-sync] Purged ${purgeable.length} tombstone(s) past TTL`);
+  return purgeable.length;
+}
+
+function startPurgeTimer() {
+  if (purgeInterval) return;
+  purgePastTTL().catch(() => {});
+  purgeInterval = setInterval(() => { purgePastTTL().catch(() => {}); }, PURGE_INTERVAL_MS);
+}
+
+function stopPurgeTimer() {
+  if (purgeInterval) { clearInterval(purgeInterval); purgeInterval = null; }
+}
+
 // ── Repo lifecycle ────────────────────────────────────────────────────
 
 async function initRepo(pi: ExtensionAPI): Promise<void> {
   ensureDir(CONFIG_DIR);
   ensureDir(AM_STORAGE);
+  ensureDir(TRASH_DIR);
 
   // Dynamic imports to avoid jiti/WASM top-level import issues
   const [{ WebSocketServer }, { Repo, ImmutableString: IS }, { NodeFSStorageAdapter }, netModule] =
@@ -548,23 +584,19 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // Track real WS connections (inbound = another peer connected to us)
   wss.on("connection", (ws: any, req: any) => {
     const remoteAddr = req.socket?.remoteAddress || "unknown";
-    const peerHost = remoteAddr.replace(/^::ffff:/, "");
-    wsConnectedPeers.set(peerHost, { since: Date.now(), direction: "in" });
-    ws.on("close", () => wsConnectedPeers.delete(peerHost));
+    const host = remoteAddr.replace(/^::ffff:/, "");
+    wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
+    ws.on("close", () => wsConnectedPeers.delete(host));
   });
 
   // ── Network adapters ──────────────────────────────────────────────
 
   const serverAdapter = new NodeWSServerAdapter(wss);
-  clientAdapters.clear();
   const adapters: any[] = [serverAdapter];
 
   for (const peer of config.peers) {
-    const [peerHost] = peer.split(":");
-    if (peerHost === hostname) continue;
-    const adapter = new WebSocketClientAdapter(`ws://${peer}`);
-    clientAdapters.set(peerHost, adapter);
-    adapters.push(adapter);
+    if (peerHost(peer) === hostname) continue;
+    adapters.push(new WebSocketClientAdapter(`ws://${peer}`));
   }
 
   // ── Create repo ───────────────────────────────────────────────────
@@ -583,10 +615,12 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     // Joining an existing network — find the document, then push our
     // local state so other peers learn about any extensions/skills
     // this machine has that they don't know about yet.
-    handle = repo.find(docUrl);
-    handle.change?.((doc: PiConfigDocument) => {
-      importAllFiles(doc);
-      doc.lastSync[hostname] = Date.now();
+    handle = await repo.find(docUrl);
+    withSuppressedExport(() => {
+      handle.change?.((doc: PiConfigDocument) => {
+        importAllFiles(doc);
+        doc.lastSync[hostname] = Date.now();
+      });
     });
   } else {
     // First run — create fresh document, then import files one at a time
@@ -618,40 +652,34 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     console.log(`[pi-sync] Imported ${files.length} files into new document`);
   }
 
-  // Listen for changes from other peers — when a remote peer pushes a
-  // change, export it to our local filesystem. We also mark outbound
-  // peers as WS-connected when we receive data from them (a stronger
-  // signal than TCP probing alone).
-  handle.on?.("change", ({ handle: changed }: any) => {
-    const doc = changed.doc?.();
+  // Export document changes to local filesystem. Disk-originated imports wrap
+  // handle.change() with suppressExportDepth; Automerge Repo currently reports
+  // all DocHandle changes with source="change", so patchInfo.source cannot
+  // reliably distinguish local from remote updates.
+  handle.on?.("change", (payload: any) => {
+    const doc = payload?.doc;
     if (!doc) return;
-    // Track last sync activity per peer (best-effort — the Automerge
-    // change event doesn't expose which peer sent it, but we can at
-    // least record that sync is flowing from the network).
-    exportAllFiles(doc);
-  });
-
-  // Periodically refresh WS-health for outbound peers via the repo's
-  // own network state. Outbound adapters managed by Automerge may go
-  // stale without us noticing; we log a warning if configured peers
-  // have no recent activity.
-  setInterval(() => {
-    if (!repo) return;
-    for (const [peerHost, adapter] of clientAdapters) {
-      // If the peer shows in wsConnectedPeers, sync is healthy.
-      // Otherwise check if it's at least TCP-reachable as a hint.
-      if (!wsConnectedPeers.has(peerHost) && !tcpReachablePeers.has(peerHost)) {
-        // Completely offline — expected if the peer machine is off.
-        // No log spam needed here.
-      }
+    if (suppressExportDepth > 0) return;
+    if (isDocEmpty(doc)) return;
+    const patches: any[] = payload?.patches ?? [];
+    if (patches.length === 0) {
+      exportAllFiles(doc);
+      return;
     }
-  }, 30_000);
+    exportKeys(doc, dirtyKeysFromPatches(patches));
+  });
 }
 
 async function shutdownRepo() {
   stopFileWatcher();
+  stopProbing();
+  stopPurgeTimer();
+  if (widgetInterval) { clearInterval(widgetInterval); widgetInterval = null; }
   wsConnectedPeers.clear();
   tcpReachablePeers.clear();
+  if (repo) {
+    try { await repo.shutdown?.(); } catch {}
+  }
   if (wss) {
     try { wss.close?.(); } catch {}
     wss = null;
@@ -664,6 +692,7 @@ async function shutdownRepo() {
 
 export default async function (pi: ExtensionAPI) {
   config = loadConfig();
+  let activeUi: ExtensionUIContext | null = null;
 
   // Write default config if missing
   ensureDir(CONFIG_DIR);
@@ -695,7 +724,7 @@ export default async function (pi: ExtensionAPI) {
         `Peers (${config.peers.length}):`,
         ...(config.peers.length > 0
           ? config.peers.map((p) => {
-              const h = p.split(":")[0];
+              const h = peerHost(p);
               const mark = wsConnectedPeers.has(h) ? "🟢" : tcpReachablePeers.has(h) ? "🔵" : "🔴";
               return `  ${mark} \`${p}\``;
             })
@@ -726,7 +755,7 @@ export default async function (pi: ExtensionAPI) {
           );
         } else {
           const list = config.peers.map((p) => {
-            const h = p.split(":")[0];
+            const h = peerHost(p);
             const mark = wsConnectedPeers.has(h) ? "🟢" : tcpReachablePeers.has(h) ? "🔵" : "🔴";
             return `  ${mark} \`${p}\``;
           }).join("\n");
@@ -744,9 +773,7 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify(`\`${target}\` is already in the peer list.`, "info");
           return;
         }
-        // Don't add self
-        const [peerHost] = target.split(":");
-        if (peerHost === hostname) {
+        if (peerHost(target) === hostname) {
           ctx.ui.notify("That's your own hostname — not adding self.", "info");
           return;
         }
@@ -764,16 +791,19 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify("Usage: \`/sync:peers remove <host>\` or \`/sync:peers remove <host:port>\`", "error");
           return;
         }
+        // Match either "host:port" exactly or just the host portion — never
+        // a string-prefix match (which would remove "host2:3030" when the
+        // user asked to remove "host").
+        const targetHost = peerHost(target);
         const before = config.peers.length;
-        config.peers = config.peers.filter((p) => !p.startsWith(target));
+        config.peers = config.peers.filter(
+          (p) => p !== target && peerHost(p) !== targetHost,
+        );
         if (config.peers.length === before) {
           ctx.ui.notify(`Peer \`${target}\` not found.`, "info");
         } else {
-          // Clean up tracking state for the removed peer
-          const [peerHost] = target.split(":");
-          wsConnectedPeers.delete(peerHost);
-          tcpReachablePeers.delete(peerHost);
-          clientAdapters.delete(peerHost);
+          wsConnectedPeers.delete(targetHost);
+          tcpReachablePeers.delete(targetHost);
           saveConfig();
           ctx.ui.notify(`Removed \`${target}\` from peers.`, "info");
         }
@@ -807,12 +837,14 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
-          // Probe each to check if pi-sync is running
-          const probed: { host: string; fqdn: string; reachable: boolean }[] = [];
-          for (const p of tailscalePeers) {
-            const ok = await probePeer(p.fqdn, config.port);
-            probed.push({ ...p, reachable: ok });
-          }
+          // Probe each in parallel to check if pi-sync is running
+          const probed: { host: string; fqdn: string; reachable: boolean }[] =
+            await Promise.all(
+              tailscalePeers.map(async (p) => ({
+                ...p,
+                reachable: await probePeer(p.fqdn, config.port),
+              })),
+            );
 
           const syncPeers = probed.filter((p) => p.reachable);
           const nonSyncPeers = probed.filter((p) => !p.reachable);
@@ -826,12 +858,10 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
-          const newSyncPeers = syncPeers.filter(
-            (p) => !config.peers.some((ep) => ep.startsWith(p.host)),
-          );
-          const alreadyConfigured = syncPeers.filter((p) =>
-            config.peers.some((ep) => ep.startsWith(p.host)),
-          );
+          const isConfigured = (host: string) =>
+            config.peers.some((ep) => peerHost(ep) === host);
+          const newSyncPeers = syncPeers.filter((p) => !isConfigured(p.host));
+          const alreadyConfigured = syncPeers.filter((p) => isConfigured(p.host));
 
           if (alreadyConfigured.length > 0) {
             ctx.ui.notify(
@@ -847,23 +877,20 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
-          const peerOptions = newSyncPeers.map((p) => ({
-            value: `${p.fqdn}:${config.port}`,
-            label: `${p.host}  →  ${p.fqdn}:${config.port}`,
-          }));
-
-          const selections = await ctx.ui.select(
-            `Found ${newSyncPeers.length} pi-sync peer(s). Select to add:`,
-            peerOptions,
+          const peerOptions = newSyncPeers.map((p) => `${p.fqdn}:${config.port}`);
+          const selection = await ctx.ui.select(
+            `Found ${newSyncPeers.length} pi-sync peer(s). Select one to add:`,
+            newSyncPeers.length > 1 ? ["Add all", ...peerOptions] : peerOptions,
           );
 
-          if (selections && selections.length > 0) {
-            for (const p of selections as string[]) {
+          if (selection) {
+            const selectedPeers = selection === "Add all" ? peerOptions : [selection];
+            for (const p of selectedPeers) {
               if (!config.peers.includes(p)) config.peers.push(p);
             }
             saveConfig();
             ctx.ui.notify(
-              `Added ${selections.length} peer(s). Run \`/reload\` to connect.`,
+              `Added ${selectedPeers.length} peer(s). Run \`/reload\` to connect.`,
               "info",
             );
           }
@@ -1023,8 +1050,11 @@ export default async function (pi: ExtensionAPI) {
       config = loadConfig();
       try {
         await initRepo(pi);
-        // After fresh init, start the watcher
+        // After fresh init, restart runtime loops stopped during unlink.
         startFileWatcher();
+        startPurgeTimer();
+        startProbing();
+        startWidgetTimer();
         ctx.ui.notify(
           "Unlinked from sync network. A fresh document has been created.\n\n" +
           "To re-join later, use \`/sync:import <url>\` from a paired machine.",
@@ -1036,6 +1066,110 @@ export default async function (pi: ExtensionAPI) {
           "warning",
         );
       }
+    },
+  });
+
+  pi.registerCommand("sync:trash", {
+    description: "Review and manage soft-deleted files (tombstones)",
+    handler: async (args, ctx) => {
+      if (!handle) {
+        ctx.ui.notify("pi-sync not initialized yet", "info");
+        return;
+      }
+      const doc = await handle.doc?.();
+      if (!doc) {
+        ctx.ui.notify("Document not ready yet", "info");
+        return;
+      }
+      const parts = (args ?? "").trim().split(/\s+/);
+      const action = parts[0] || "list";
+      const fileArg = normalizeFileKey(parts.slice(1).join(" ")) ?? "";
+
+      type Hit = { key: string; section: "extensions" | "skills" | "prompts"; entry: SyncedFile };
+      const tombstones: Hit[] = [];
+      for (const section of ["extensions", "skills", "prompts"] as const) {
+        const col = doc[section] as Record<string, SyncedFile>;
+        for (const [key, entry] of Object.entries(col)) {
+          if (isTombstone(entry)) tombstones.push({ key, section, entry });
+        }
+      }
+
+      const ttlDays = Math.round(TOMBSTONE_TTL_MS / 86_400_000);
+
+      if (action === "list" || action === "ls") {
+        if (tombstones.length === 0) {
+          ctx.ui.notify(`Trash is empty. TTL: ${ttlDays} days.`, "info");
+          return;
+        }
+        const now = Date.now();
+        const lines = tombstones.map(({ key, entry }) => {
+          const ageDays = Math.floor((now - (entry.deletedAt as number)) / 86_400_000);
+          const past = isPastTTL(entry, now) ? "  ⚠ past TTL" : "";
+          return `  \`${key}\` — by \`${entry.deletedBy ?? "?"}\`, ${ageDays}d ago${past}`;
+        });
+        ctx.ui.notify(
+          `**Trash (${tombstones.length}):**\n${lines.join("\n")}\n\n` +
+          `Restore: \`/sync:trash restore <path>\`\n` +
+          `Finalize: \`/sync:trash empty <path>\`\n` +
+          `Finalize all past TTL: \`/sync:trash empty\``,
+          "info",
+        );
+        return;
+      }
+
+      if (action === "restore") {
+        if (!fileArg) {
+          ctx.ui.notify("Usage: \`/sync:trash restore <path>\`", "error");
+          return;
+        }
+        const hit = tombstones.find((t) => t.key === fileArg);
+        if (!hit) {
+          ctx.ui.notify(`No tombstone for \`${fileArg}\`.`, "info");
+          return;
+        }
+        handle.change?.((d: PiConfigDocument) => {
+          const col = d[hit.section] as Record<string, SyncedFile>;
+          const e = col[fileArg];
+          if (e) { delete e.deletedAt; delete e.deletedBy; }
+        });
+        restoreFromTrash(fileArg);
+        ctx.ui.notify(`Restored \`${fileArg}\`.`, "info");
+        return;
+      }
+
+      if (action === "empty") {
+        if (fileArg) {
+          const hit = tombstones.find((t) => t.key === fileArg);
+          if (!hit) {
+            ctx.ui.notify(`No tombstone for \`${fileArg}\`.`, "info");
+            return;
+          }
+          handle.change?.((d: PiConfigDocument) => {
+            const col = d[hit.section] as Record<string, SyncedFile>;
+            delete col[fileArg];
+          });
+          purgeFromTrash(fileArg);
+          ctx.ui.notify(`Finalized deletion of \`${fileArg}\`.`, "info");
+          return;
+        }
+        const n = await purgePastTTL();
+        ctx.ui.notify(
+          n === 0
+            ? `No tombstones past TTL (${ttlDays} days).`
+            : `Finalized ${n} tombstone(s) past TTL.`,
+          "info",
+        );
+        return;
+      }
+
+      ctx.ui.notify(
+        "Usage:\n" +
+        "  \`/sync:trash\`                  — list tombstones\n" +
+        "  \`/sync:trash restore <path>\`   — un-delete\n" +
+        "  \`/sync:trash empty <path>\`     — finalize one\n" +
+        "  \`/sync:trash empty\`            — finalize all past TTL",
+        "info",
+      );
     },
   });
 
@@ -1053,7 +1187,7 @@ export default async function (pi: ExtensionAPI) {
       }
       const parts = (args ?? "").trim().split(/\s+/);
       const action = parts[0];
-      const fileArg = parts[1];
+      const fileArg = parts[1] ? normalizeFileKey(parts[1]) : null;
 
       if (action === "list" || !action) {
         const entries = Object.entries(doc.localOnly as Record<string, string[]>);
@@ -1096,15 +1230,15 @@ export default async function (pi: ExtensionAPI) {
   // ── Status widget (footer) ────────────────────────────────────────
 
   function updateStatusWidget(doc?: PiConfigDocument) {
-    if (!pi.setWidget) return;
+    if (!activeUi) return;
     const extCount = Object.keys(doc?.extensions ?? {}).length;
     const skillCount = Object.keys(doc?.skills ?? {}).length;
     const total = config.peers.length;
 
     // Count WS-connected (real sync) and TCP-only reachable peers
-    const wsOnline = config.peers.filter((p) => wsConnectedPeers.has(p.split(":")[0])).length;
+    const wsOnline = config.peers.filter((p) => wsConnectedPeers.has(peerHost(p))).length;
     const tcpOnly = config.peers.filter((p) => {
-      const h = p.split(":")[0];
+      const h = peerHost(p);
       return !wsConnectedPeers.has(h) && tcpReachablePeers.has(h);
     }).length;
 
@@ -1124,27 +1258,33 @@ export default async function (pi: ExtensionAPI) {
     if (total > 0) {
       peerList = config.peers
         .map((p) => {
-          const host = p.split(":")[0];
+          const host = peerHost(p);
           const mark = wsConnectedPeers.has(host) ? "🟢" : tcpReachablePeers.has(host) ? "🔵" : "🔴";
           return mark + " " + host;
         })
         .join(" ");
     }
 
-    pi.setWidget("pi-sync", [
+    activeUi.setWidget("pi-sync", [
       `🔗 ${peerStatus}  │  📦 ${extCount}e ${skillCount}s`,
       ...(peerList ? [peerList] : []),
     ]);
   }
 
   // Update widget periodically + after probing
-  setInterval(() => {
-    if (handle) {
-      handle.doc?.().then((doc?: PiConfigDocument) => updateStatusWidget(doc));
-    } else {
-      updateStatusWidget();
-    }
-  }, 5000);
+  function startWidgetTimer() {
+    if (widgetInterval) return;
+    widgetInterval = setInterval(() => {
+      if (handle) {
+        try {
+          updateStatusWidget(handle.doc?.());
+        } catch {}
+      } else {
+        updateStatusWidget();
+      }
+    }, 5000);
+  }
+  startWidgetTimer();
 
   // ── Initialize repo in background ──────────────────────────────────
 
@@ -1158,28 +1298,36 @@ export default async function (pi: ExtensionAPI) {
 
   // ── Lifecycle ─────────────────────────────────────────────────────
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
+    activeUi = ctx.ui;
     if (!handle) return;
     const doc = await handle.doc?.();
     if (!doc) return;
 
-    handle.change?.((d: PiConfigDocument) => {
-      importAllFiles(d);
+    withSuppressedExport(() => {
+      handle.change?.((d: PiConfigDocument) => {
+        importAllFiles(d);
+      });
     });
 
     // Start health probing
     startProbing();
+    updateStatusWidget(doc);
   });
 
-  pi.on("session_shutdown", async (event) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     stopProbing();
+    ctx.ui.setWidget("pi-sync", undefined);
+    if (activeUi === ctx.ui) activeUi = null;
     if (handle) {
       const doc = await handle.doc?.();
       if (doc) {
         try {
-          handle.change?.((d: PiConfigDocument) => {
-            importAllFiles(d);
-            d.lastSync[hostname] = Date.now();
+          withSuppressedExport(() => {
+            handle.change?.((d: PiConfigDocument) => {
+              importAllFiles(d);
+              d.lastSync[hostname] = Date.now();
+            });
           });
         } catch {}
       }
@@ -1189,8 +1337,9 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // ── Start watcher after init ──────────────────────────────────────
+  // ── Start watcher + purge timer after init ────────────────────────
   // initRepo has already completed at this point (awaited above), so
   // the repo and handle are ready.
   startFileWatcher();
+  startPurgeTimer();
 }
