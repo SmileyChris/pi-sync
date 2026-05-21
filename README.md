@@ -9,6 +9,20 @@ cd ~/.pi/agent/extensions/pi-sync
 npm install
 ```
 
+## Quick start
+
+On the **first machine** (creator), run `/sync:info` and copy the `automerge:…` URL.
+
+On a **second machine** (joiner):
+
+```
+/sync:peers add <first-machine-hostname>:3030
+/sync:import <automerge-url>
+/reload
+```
+
+Both machines must be reachable over your network (typically a Tailscale tailnet). See [Pair machines](docs/get-started/pair-machines.md) for the full guide.
+
 ## Docs
 
 Full documentation lives under `docs/`. To read it as a site:
