@@ -100,6 +100,7 @@ let crashGuardInstalled = false;
 // stays on disk after restart. Flipped by initRepo once the handle is
 // ready, then by every export afterwards.
 let initialSyncReady = false;
+let standbyMode = false; // true while waiting for primary instance to exit
 
 let pendingChanges = new Set<string>();
 let watchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -813,6 +814,7 @@ async function shutdownRepo() {
 // ── Watchdog: waits for the primary instance to exit, then takes over ─
 
 async function watchAndTakeOver(pi: ExtensionAPI) {
+  standbyMode = true;
   const { default: WebSocket } = await import("ws");
   await new Promise<void>((resolve) => {
     const ws = new WebSocket(`ws://localhost:${config.port}`);
@@ -824,6 +826,7 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
     });
     ws.on("error", () => resolve());
   });
+  standbyMode = false;
   await initRepo(pi);
   // If we just took over, kick off the runtime loops that initRepo
   // normally starts (watcher, probing, purge). These would have been
@@ -878,7 +881,7 @@ export default async function (pi: ExtensionAPI) {
         ``,
         `Syncing: ${onOff(config.syncSettings)} settings  ${onOff(config.syncModels)} models  ${onOff(config.syncExtensions)} extensions  ${onOff(config.syncSkills)} skills  ${onOff(config.syncPrompts)} prompts`,
         ``,
-        `Tracked: \`${Object.keys(doc?.extensions ?? {}).length}\` extensions, \`${Object.keys(doc?.skills ?? {}).length}\` skills, \`${Object.keys(doc?.prompts ?? {}).length}\` prompts`,
+        `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts`,
         `Local-only: \`${Object.keys(doc?.localOnly ?? {}).length}\` entries`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
@@ -1376,8 +1379,17 @@ export default async function (pi: ExtensionAPI) {
 
   function updateStatusWidget(doc?: PiConfigDocument) {
     if (!activeUi) return;
+
+    if (standbyMode) {
+      activeUi.setWidget("pi-sync", [
+        `↳ sync on :${config.port} (standby)`,
+      ]);
+      return;
+    }
+
     const extCount = Object.keys(doc?.extensions ?? {}).length;
     const skillCount = Object.keys(doc?.skills ?? {}).length;
+    const promptCount = Object.keys(doc?.prompts ?? {}).length;
     const total = config.peers.length;
 
     // Count WS-connected (real sync) and TCP-only reachable peers
@@ -1411,7 +1423,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     activeUi.setWidget("pi-sync", [
-      `🔗 ${peerStatus}  │  📦 ${extCount}e ${skillCount}s`,
+      `🔗 ${peerStatus}  │  🔌 ${extCount}  🔧 ${skillCount}  ✏️  ${promptCount}`,
       ...(peerList ? [peerList] : []),
     ]);
   }
@@ -1477,11 +1489,7 @@ export default async function (pi: ExtensionAPI) {
   // ── Start syncing (or wait for takeover) ──────────────────────────
 
   if (await probePeer("localhost", config.port, 500)) {
-    console.log(
-      `[pi-sync] Port ${config.port} already in use — ` +
-      `commands available, waiting for primary to exit before sync`,
-    );
-    // Background: don't block pi startup
+    // Background watchdog — pi continues immediately, widget shows status
     watchAndTakeOver(pi).catch((e: any) =>
       console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
     );
