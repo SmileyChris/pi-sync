@@ -256,7 +256,15 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
 
   const absPath = piPathForKey(key);
   if (!absPath) return false;
-  if (!fs.existsSync(absPath)) return false;
+  // Stat instead of existsSync so we skip directories — fs.watch fires for
+  // mkdir/rmdir too, and readFileSync on a dir throws EISDIR.
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(absPath);
+  } catch {
+    return false;
+  }
+  if (!st.isFile()) return false;
   const content = fs.readFileSync(absPath, "utf-8");
 
   if (subdir === "settings" || subdir === "models") {
@@ -444,7 +452,13 @@ async function flushPendingChanges() {
 
   withSuppressedExport(() => {
     handle.change?.((doc: PiConfigDocument) => {
-      for (const key of present) importFile(doc, key);
+      for (const key of present) {
+        try {
+          importFile(doc, key);
+        } catch (err: any) {
+          console.error(`[pi-sync] importFile failed for ${key}:`, err?.message ?? err);
+        }
+      }
       if (blockedDeletions) return;
       for (const key of deletions) {
         const subdir = getSubdir(key) as "extensions" | "skills" | "prompts";
@@ -475,10 +489,22 @@ function startFileWatcher() {
         filename.startsWith(".obgo")
       ) return;
 
-      const key = normalizeFileKey(fileKey(path.join(PI_DIR, filename)));
+      const absPath = path.join(PI_DIR, filename);
+      const key = normalizeFileKey(fileKey(absPath));
       if (!key || !shouldSync(key, config)) return;
       const subdir = getSubdir(key);
       if (!subdir) return;
+
+      // Skip directory events — fs.watch fires for mkdir/rmdir too and we
+      // only sync files. Cheap upfront check stops dogpiles where a dir
+      // keeps generating events that fail import.
+      try {
+        const st = fs.statSync(absPath);
+        if (st.isDirectory()) return;
+      } catch {
+        // Stat failed (race: deletion). Let flush handle it as a missing
+        // key → potential tombstone.
+      }
 
       pendingChanges.add(key);
       if (watchTimer) clearTimeout(watchTimer);
@@ -573,10 +599,11 @@ function installCrashGuard() {
 
   const handle = (err: unknown, kind: "exception" | "rejection") => {
     if (!isAutomergeError(err)) {
-      // Not ours — let the default fatal behavior happen.
+      // Log and swallow. Re-throwing here would re-enter this same handler
+      // (uncaughtException loops on itself), so we leave the error to
+      // pi's own top-level handler / surface it via the log only. Avoid
+      // process.exit so other extensions aren't taken down by ours.
       console.error(`[pi-sync] uncaught ${kind} (not automerge):`, err);
-      // Re-raise on next tick so default unhandled-exception behavior fires.
-      setImmediate(() => { throw err; });
       return;
     }
     const msg = (err as any)?.message ?? String(err);
