@@ -648,6 +648,27 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   ensureDir(AM_STORAGE);
   ensureDir(TRASH_DIR);
 
+  // If another pi instance already holds the port, connect a plain
+  // WebSocket client (no Automerge) and wait for it to drop. When the
+  // primary exits, we take over the port automatically.
+  if (await probePeer("localhost", config.port, 500)) {
+    console.log(
+      `[pi-sync] Port ${config.port} already in use — ` +
+      `waiting for primary instance to exit before taking over`,
+    );
+    const { default: WebSocket } = await import("ws");
+    await new Promise<void>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${config.port}`);
+      ws.on("close", () => {
+        console.log(
+          `[pi-sync] Primary instance exited — taking over port ${config.port}`,
+        );
+        resolve();
+      });
+      ws.on("error", () => resolve());
+    });
+  }
+
   installCrashGuard();
 
   // Dynamic imports to avoid jiti/WASM top-level import issues
