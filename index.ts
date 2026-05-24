@@ -1382,7 +1382,7 @@ export default async function (pi: ExtensionAPI) {
 
     if (standbyMode) {
       activeUi.setWidget("pi-sync", [
-        `↳ sync on :${config.port} (standby)`,
+        `⛓️ sync standby`,
       ]);
       return;
     }
