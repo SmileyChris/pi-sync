@@ -1382,7 +1382,7 @@ export default async function (pi: ExtensionAPI) {
 
     if (standbyMode) {
       activeUi.setWidget("pi-sync", [
-        `⛓️ sync standby`,
+        `⛓️  sync standby`,
       ]);
       return;
     }
@@ -1449,6 +1449,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     activeUi = ctx.ui;
+    updateStatusWidget(); // show standby/active state immediately
     if (!handle) return;
     const doc = await handle.doc?.();
     if (!doc) return;
