@@ -140,6 +140,7 @@ async function probeAllPeers() {
 
 let probeInterval: ReturnType<typeof setInterval> | null = null;
 function startProbing() {
+  if (probeInterval) return;
   probeAllPeers(); // immediate first probe
   probeInterval = setInterval(probeAllPeers, 15_000); // every 15s
 }
@@ -648,27 +649,6 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   ensureDir(AM_STORAGE);
   ensureDir(TRASH_DIR);
 
-  // If another pi instance already holds the port, connect a plain
-  // WebSocket client (no Automerge) and wait for it to drop. When the
-  // primary exits, we take over the port automatically.
-  if (await probePeer("localhost", config.port, 500)) {
-    console.log(
-      `[pi-sync] Port ${config.port} already in use — ` +
-      `waiting for primary instance to exit before taking over`,
-    );
-    const { default: WebSocket } = await import("ws");
-    await new Promise<void>((resolve) => {
-      const ws = new WebSocket(`ws://localhost:${config.port}`);
-      ws.on("close", () => {
-        console.log(
-          `[pi-sync] Primary instance exited — taking over port ${config.port}`,
-        );
-        resolve();
-      });
-      ws.on("error", () => resolve());
-    });
-  }
-
   installCrashGuard();
 
   // Dynamic imports to avoid jiti/WASM top-level import issues
@@ -828,6 +808,30 @@ async function shutdownRepo() {
   }
   repo = null;
   handle = null;
+}
+
+// ── Watchdog: waits for the primary instance to exit, then takes over ─
+
+async function watchAndTakeOver(pi: ExtensionAPI) {
+  const { default: WebSocket } = await import("ws");
+  await new Promise<void>((resolve) => {
+    const ws = new WebSocket(`ws://localhost:${config.port}`);
+    ws.on("close", () => {
+      console.log(
+        `[pi-sync] Primary instance exited — taking over port ${config.port}`,
+      );
+      resolve();
+    });
+    ws.on("error", () => resolve());
+  });
+  await initRepo(pi);
+  // If we just took over, kick off the runtime loops that initRepo
+  // normally starts (watcher, probing, purge). These would have been
+  // started by the session_start handler if a session is already active,
+  // but call them here just in case.
+  startFileWatcher();
+  startPurgeTimer();
+  startProbing();
 }
 
 // ── Extension entry point ─────────────────────────────────────────────
@@ -1427,17 +1431,9 @@ export default async function (pi: ExtensionAPI) {
   }
   startWidgetTimer();
 
-  // ── Initialize repo in background ──────────────────────────────────
-
-  try {
-    await initRepo(pi);
-  } catch (e: any) {
-    console.error("[pi-sync] Failed to initialize sync repo:", e.message);
-    // Commands still work — they'll report "not initialized"
-    return;
-  }
-
   // ── Lifecycle ─────────────────────────────────────────────────────
+  // Register these before init so they're always active (even when
+  // waiting for takeover).
 
   pi.on("session_start", async (_event, ctx) => {
     activeUi = ctx.ui;
@@ -1478,9 +1474,24 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // ── Start watcher + purge timer after init ────────────────────────
-  // initRepo has already completed at this point (awaited above), so
-  // the repo and handle are ready.
-  startFileWatcher();
-  startPurgeTimer();
+  // ── Start syncing (or wait for takeover) ──────────────────────────
+
+  if (await probePeer("localhost", config.port, 500)) {
+    console.log(
+      `[pi-sync] Port ${config.port} already in use — ` +
+      `commands available, waiting for primary to exit before sync`,
+    );
+    // Background: don't block pi startup
+    watchAndTakeOver(pi).catch((e: any) =>
+      console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+    );
+  } else {
+    try {
+      await initRepo(pi);
+      startFileWatcher();
+      startPurgeTimer();
+    } catch (e: any) {
+      console.error("[pi-sync] Failed to initialize sync repo:", e.message);
+    }
+  }
 }
