@@ -93,6 +93,14 @@ let suppressExportDepth = 0;
 let activeUi: ExtensionUIContext | null = null;
 let crashGuardInstalled = false;
 
+// Gate exports until the handle reaches the "ready" state (initial sync
+// loaded). Without this gate, incremental sync patches fire `change` for
+// each piece of an incoming snapshot and we end up writing a half-loaded
+// tree to disk — and if the peer is killed mid-stream, that partial tree
+// stays on disk after restart. Flipped by initRepo once the handle is
+// ready, then by every export afterwards.
+let initialSyncReady = false;
+
 let pendingChanges = new Set<string>();
 let watchTimer: ReturnType<typeof setTimeout> | null = null;
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -143,6 +151,23 @@ function stopProbing() {
 
 function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+/** Write content atomically: tmp file in same dir, then rename. POSIX
+ *  rename within one filesystem is atomic, so readers never observe a
+ *  half-written file. */
+function atomicWriteFile(absPath: string, content: string) {
+  ensureDir(path.dirname(absPath));
+  const tmp = `${absPath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, absPath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 function loadConfig(): SyncConfig {
@@ -334,8 +359,7 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   if (subdir === "settings" || subdir === "models") {
     const content = JSON.stringify(doc[subdir], null, 2) + "\n";
     if (readFileOrEmpty(absPath) === content) return false;
-    ensureDir(path.dirname(absPath));
-    fs.writeFileSync(absPath, content);
+    atomicWriteFile(absPath, content);
     return true;
   }
 
@@ -356,8 +380,7 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
 
   const content = unwrapContent(synced) ?? "";
   if (readFileOrEmpty(absPath) === content) return false;
-  ensureDir(path.dirname(absPath));
-  fs.writeFileSync(absPath, content);
+  atomicWriteFile(absPath, content);
   return true;
 }
 
@@ -691,12 +714,6 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     // local state so other peers learn about any extensions/skills
     // this machine has that they don't know about yet.
     handle = await repo.find(docUrl);
-    withSuppressedExport(() => {
-      handle.change?.((doc: PiConfigDocument) => {
-        importAllFiles(doc);
-        doc.lastSync[hostname] = Date.now();
-      });
-    });
   } else {
     // First run — create fresh document, then import files one at a time
     handle = repo.create({
@@ -721,17 +738,14 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
         importFile(doc, fileKey);
       });
     }
-    handle.change((doc: PiConfigDocument) => {
-      doc.lastSync[hostname] = Date.now();
-    });
     console.log(`[pi-sync] Imported ${files.length} files into new document`);
   }
 
-  // Export document changes to local filesystem. Disk-originated imports wrap
-  // handle.change() with suppressExportDepth; Automerge Repo currently reports
-  // all DocHandle changes with source="change", so patchInfo.source cannot
-  // reliably distinguish local from remote updates.
+  // Attach the change listener BEFORE awaiting whenReady so we don't miss
+  // patches, but gate exports on `initialSyncReady`. Without the gate,
+  // each sync patch arriving mid-snapshot writes a partial tree to disk.
   handle.on?.("change", (payload: any) => {
+    if (!initialSyncReady) return;
     const doc = payload?.doc;
     if (!doc) return;
     if (suppressExportDepth > 0) return;
@@ -743,6 +757,37 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     }
     exportKeys(doc, dirtyKeysFromPatches(patches));
   });
+
+  // Wait for the doc to reach "ready" before doing any export work.
+  // - Newly created docs (above) resolve immediately.
+  // - Joining peers resolve once the initial snapshot is loaded.
+  // If the join is interrupted (network drop, peer killed), whenReady
+  // never resolves and nothing gets exported — disk stays clean.
+  try {
+    await handle.whenReady?.();
+  } catch (err: any) {
+    console.error("[pi-sync] handle never became ready:", err?.message ?? err);
+    return;
+  }
+
+  const readyDoc = await handle.doc?.();
+  if (readyDoc) {
+    // Push our local files into the doc now that we know the full remote
+    // state, so peers learn about anything we have that they don't.
+    withSuppressedExport(() => {
+      handle.change?.((doc: PiConfigDocument) => {
+        importAllFiles(doc);
+        doc.lastSync[hostname] = Date.now();
+      });
+    });
+
+    // One bulk export of the full tree, then mark ready so subsequent
+    // change patches are exported incrementally.
+    if (!isDocEmpty(readyDoc)) {
+      exportAllFiles(readyDoc);
+    }
+  }
+  initialSyncReady = true;
 }
 
 async function shutdownRepo() {
@@ -752,6 +797,7 @@ async function shutdownRepo() {
   if (widgetInterval) { clearInterval(widgetInterval); widgetInterval = null; }
   wsConnectedPeers.clear();
   tcpReachablePeers.clear();
+  initialSyncReady = false;
   if (repo) {
     try { await repo.shutdown?.(); } catch {}
   }
