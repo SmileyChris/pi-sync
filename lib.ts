@@ -279,6 +279,38 @@ export function mergeSettingsIntoDoc(
   return hasDiff ? merged : null;
 }
 
+/**
+ * Apply a JSON file's contents to a settings/models subtree in place.
+ * `target` is an Automerge proxy; writes only plain parsed values, never
+ * re-assigns nested proxies (which would throw "Cannot create a reference
+ * to an existing document object"). Returns true if anything changed.
+ */
+export function applyJsonMergeInPlace(
+  target: Record<string, unknown>,
+  fileContent: string,
+): boolean {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(fileContent);
+  } catch {
+    return false;
+  }
+  let changed = false;
+  for (const k of Object.keys(target)) {
+    if (!(k in parsed)) {
+      delete target[k];
+      changed = true;
+    }
+  }
+  for (const [k, v] of Object.entries(parsed)) {
+    if (JSON.stringify(target[k]) !== JSON.stringify(v)) {
+      target[k] = v;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 /** True iff the file entry has a soft-delete marker. */
 export function isTombstone(file: SyncedFile | undefined): boolean {
   return !!file && typeof file.deletedAt === "number";

@@ -6,6 +6,7 @@
 
 import { describe, it, expect } from "vitest";
 import * as path from "node:path";
+import * as Automerge from "@automerge/automerge";
 import {
   type SyncConfig,
   type PiConfigDocument,
@@ -18,6 +19,7 @@ import {
   isLocalOnly,
   shouldSync,
   mergeSettingsIntoDoc,
+  applyJsonMergeInPlace,
   unwrapContent,
   syncedFileContentMatches,
   loadConfig,
@@ -296,6 +298,71 @@ describe("mergeSettingsIntoDoc", () => {
     const doc = { a: 1, b: 2 };
     mergeSettingsIntoDoc(doc, JSON.stringify({ a: 1 }));
     expect(doc).toEqual({ a: 1, b: 2 });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+//  applyJsonMergeInPlace — must work on real Automerge proxies
+// ══════════════════════════════════════════════════════════════════════
+
+describe("applyJsonMergeInPlace", () => {
+  it("returns false on invalid JSON", () => {
+    expect(applyJsonMergeInPlace({}, "not json")).toBe(false);
+  });
+
+  it("returns false when content matches", () => {
+    expect(applyJsonMergeInPlace({ a: 1 }, '{"a":1}')).toBe(false);
+  });
+
+  it("writes added/changed keys and deletes missing keys on plain objects", () => {
+    const target: Record<string, unknown> = { a: 1, b: 2 };
+    const changed = applyJsonMergeInPlace(target, JSON.stringify({ a: 1, c: 3 }));
+    expect(changed).toBe(true);
+    expect(target).toEqual({ a: 1, c: 3 });
+  });
+
+  // Regression: previously, spread of an Automerge proxy captured nested
+  // proxies; reassigning them threw "Cannot create a reference to an
+  // existing document object" inside Automerge.change.
+  it("does not throw when applied to an Automerge proxy with nested objects", () => {
+    let doc = Automerge.from({
+      models: {
+        opus: { id: "claude-opus", display: "Opus" },
+        sonnet: { id: "claude-sonnet", display: "Sonnet" },
+      },
+    } as Record<string, unknown>);
+
+    const newContent = JSON.stringify({
+      opus: { id: "claude-opus", display: "Opus 4.7" },
+      sonnet: { id: "claude-sonnet", display: "Sonnet" },
+    });
+
+    expect(() => {
+      doc = Automerge.change(doc, (d: any) => {
+        applyJsonMergeInPlace(d.models, newContent);
+      });
+    }).not.toThrow();
+
+    expect((doc as any).models.opus.display).toBe("Opus 4.7");
+    expect((doc as any).models.sonnet.id).toBe("claude-sonnet");
+  });
+
+  it("deletes nested keys removed from JSON on an Automerge proxy", () => {
+    let doc = Automerge.from({
+      models: {
+        opus: { id: "claude-opus" },
+        sonnet: { id: "claude-sonnet" },
+      },
+    } as Record<string, unknown>);
+
+    const newContent = JSON.stringify({ opus: { id: "claude-opus" } });
+
+    doc = Automerge.change(doc, (d: any) => {
+      applyJsonMergeInPlace(d.models, newContent);
+    });
+
+    expect((doc as any).models.sonnet).toBeUndefined();
+    expect((doc as any).models.opus.id).toBe("claude-opus");
   });
 });
 

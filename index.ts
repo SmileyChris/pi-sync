@@ -51,7 +51,7 @@ import {
   getSubdir,
   isLocalOnly,
   shouldSync,
-  mergeSettingsIntoDoc,
+  applyJsonMergeInPlace,
   unwrapContent,
   syncedFileContentMatches,
   loadConfig as loadConfigFromFile,
@@ -87,6 +87,11 @@ const tcpReachablePeers = new Set<string>();
 // Export guard: prevent fs.watch from re-importing files we're writing
 let exporting = false;
 let suppressExportDepth = 0;
+
+// Active session UI context (set in session_start). Module-scoped so the
+// uncaughtException crash guard can surface notifications to the user.
+let activeUi: ExtensionUIContext | null = null;
+let crashGuardInstalled = false;
 
 let pendingChanges = new Set<string>();
 let watchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -240,23 +245,6 @@ function clearDocUrl() {
 }
 
 // ── Import: filesystem → document ─────────────────────────────────────
-
-/** Apply mergeSettingsIntoDoc result in place on the Automerge proxy.
- *  Keeps per-key writes so the CRDT preserves concurrent edits. */
-function applyJsonMergeInPlace(
-  target: Record<string, unknown>,
-  fileContent: string,
-): boolean {
-  const merged = mergeSettingsIntoDoc(target, fileContent);
-  if (!merged) return false;
-  for (const k of Object.keys(target)) {
-    if (!(k in merged)) delete target[k];
-  }
-  for (const [k, v] of Object.entries(merged)) {
-    target[k] = v;
-  }
-  return true;
-}
 
 function importFile(doc: PiConfigDocument, fileKey: string): boolean {
   const key = normalizeFileKey(fileKey);
@@ -547,10 +535,70 @@ function stopPurgeTimer() {
 
 // ── Repo lifecycle ────────────────────────────────────────────────────
 
+/** True iff err originates from Automerge wasm or matches a known
+ *  Automerge-only error message. We narrow the crash guard to these so we
+ *  don't mask unrelated bugs in pi or other extensions. */
+function isAutomergeError(err: unknown): boolean {
+  if (!err) return false;
+  const e = err as { stack?: unknown; message?: unknown };
+  const s = String(e.stack ?? e.message ?? err);
+  return /automerge_wasm|PatchLogMismatch|recursive use of an object|RuntimeError: unreachable|Cannot create a reference to an existing document/.test(
+    s,
+  );
+}
+
+/** Move ~/.pi/am-storage out of the way so the next start gets a clean
+ *  repo (it will re-sync from peers via the saved doc URL). Returns the
+ *  destination path, or null if there was nothing to move. */
+function quarantineStorage(): string | null {
+  try {
+    if (!fs.existsSync(AM_STORAGE)) return null;
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const dest = `${AM_STORAGE}.corrupt.${ts}`;
+    fs.renameSync(AM_STORAGE, dest);
+    return dest;
+  } catch (e: any) {
+    console.error("[pi-sync] Failed to quarantine storage:", e?.message ?? e);
+    return null;
+  }
+}
+
+/** Install a one-shot guard against Automerge wasm panics. Without this,
+ *  a PatchLogMismatch (or follow-on "recursive use of an object") tears
+ *  down the whole pi process. The guard keeps pi alive, stops sync, and
+ *  quarantines storage so the next start is clean. */
+function installCrashGuard() {
+  if (crashGuardInstalled) return;
+  crashGuardInstalled = true;
+
+  const handle = (err: unknown, kind: "exception" | "rejection") => {
+    if (!isAutomergeError(err)) {
+      // Not ours — let the default fatal behavior happen.
+      console.error(`[pi-sync] uncaught ${kind} (not automerge):`, err);
+      // Re-raise on next tick so default unhandled-exception behavior fires.
+      setImmediate(() => { throw err; });
+      return;
+    }
+    const msg = (err as any)?.message ?? String(err);
+    console.error(`[pi-sync] Automerge ${kind} caught:`, msg);
+    const dest = quarantineStorage();
+    void shutdownRepo().catch(() => {});
+    const note =
+      `pi-sync hit an Automerge crash and stopped.${dest ? `\nStorage quarantined → \`${dest}\`` : ""}\n` +
+      `Run \`/reload\` to restart sync. If the crash recurs, run \`/sync:unlink\` and re-import from a peer.`;
+    try { activeUi?.notify(note, "warning"); } catch {}
+  };
+
+  process.on("uncaughtException", (err) => handle(err, "exception"));
+  process.on("unhandledRejection", (reason) => handle(reason, "rejection"));
+}
+
 async function initRepo(pi: ExtensionAPI): Promise<void> {
   ensureDir(CONFIG_DIR);
   ensureDir(AM_STORAGE);
   ensureDir(TRASH_DIR);
+
+  installCrashGuard();
 
   // Dynamic imports to avoid jiti/WASM top-level import issues
   const [{ WebSocketServer }, { Repo, ImmutableString: IS }, { NodeFSStorageAdapter }, netModule] =
@@ -692,7 +740,6 @@ async function shutdownRepo() {
 
 export default async function (pi: ExtensionAPI) {
   config = loadConfig();
-  let activeUi: ExtensionUIContext | null = null;
 
   // Write default config if missing
   ensureDir(CONFIG_DIR);

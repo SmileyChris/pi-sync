@@ -12,7 +12,7 @@ P2P sync for pi coding agent settings using [Automerge](https://automerge.org/) 
 | Skills     | `syncSkills`       | `~/.pi/agent/skills/**/*.md`                           |
 | Prompts    | `syncPrompts`      | `~/.pi/agent/prompts/**/*.md`, `**/*.txt`              |
 
-The `pi-sync` extension itself is **never** synced. It is skipped by file collection and sync gating, and the document is also pinned to `localOnly` on creation because its WASM binaries and peer config are machine-specific.
+The `pi-sync` extension itself is **never** synced — it is skipped by file collection and `shouldSync` gating, and its entries in the Automerge document are pinned to `localOnly` on creation because its WASM binaries and peer config are machine-specific.
 
 ## Next steps
 
