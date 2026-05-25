@@ -32,7 +32,6 @@ import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-a
 import { Container, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -68,99 +67,14 @@ import {
 
 export type { SyncedFile, PiConfigDocument, SyncConfig };
 
-// ── Module-level state ────────────────────────────────────────────────
-//
-// pi loads extensions through jiti with `moduleCache: false`, so this
-// module is fully re-executed on every `/new` and `/reload`. Module-level
-// `let` bindings are reset to their defaults on each load, which made the
-// previous reentry guard inert (it checked vars in its own freshly-
-// initialized module instance, not the previous one's live state).
-//
-// To keep one source of truth across re-instantiations within a process,
-// all mutable runtime state lives on a singleton object stashed on
-// globalThis — see the `state` declaration further down, just after the
-// bare consts that are safe to re-evaluate on every load.
-
-const hostname = os.hostname();
-const WATCH_DEBOUNCE_MS = 500;
-const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
-const RECENT_REMOTE_CHANGES_CAP = 50;    // ring-buffer cap for the footer/status hint
-
-type SyncState = {
-  config: SyncConfig;
-  repo: any;
-  handle: any;
-  wss: any;
-  watcher: fs.FSWatcher | null;
-  ImmutableString: any;
-  wsConnectedPeers: Map<string, { since: number; direction: "in" | "out" }>;
-  tcpReachablePeers: Set<string>;
-  exporting: boolean;
-  suppressExportDepth: number;
-  activeUi: ExtensionUIContext | null;
-  crashGuardInstalled: boolean;
-  initialSyncReady: boolean;
-  // True from entry into initRepo (or from probePeer at the bottom of the
-  // entry point) until the resulting handle / standby state is observable
-  // to the next module load. Closes the race where a `/new` fires inside
-  // initRepo's async gap before state.wss / state.handle exist.
-  initInProgress: boolean;
-  standbyMode: boolean;
-  pendingChanges: Set<string>;
-  watchTimer: ReturnType<typeof setTimeout> | null;
-  renderTimer: ReturnType<typeof setInterval> | null;
-  tuiRef: any;
-  currentCtx: any;
-  purgeInterval: ReturnType<typeof setInterval> | null;
-  probeInterval: ReturnType<typeof setInterval> | null;
-  lastRemoteChangeTime: number;
-  recentRemoteChanges: string[];
-  pendingInstalls: Set<string>;
-  installRunning: boolean;
-  // Snapshot of config.peers taken when initRepo wired up the network
-  // adapters. The running Automerge repo binds its peer list at
-  // construction; later /sync:peers add|remove edits config.peers and
-  // disk, but the live adapter set won't change until /reload. This
-  // snapshot lets /sync:status surface "edited since last reload".
-  peersAtInit: string[];
-};
-
-// Symbol key so we don't collide with anyone else stashing things on
-// globalThis. Symbol.for so multiple jiti-loaded copies of this module
-// resolve to the same singleton.
-const STATE_KEY = Symbol.for("pi-sync:state");
-type StateHost = typeof globalThis & { [STATE_KEY]?: SyncState };
-
-const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
-  config: { ...DEFAULT_SYNC_CONFIG },
-  repo: null,
-  handle: null,
-  wss: null,
-  watcher: null,
-  ImmutableString: null,
-  wsConnectedPeers: new Map(),
-  tcpReachablePeers: new Set(),
-  exporting: false,
-  suppressExportDepth: 0,
-  activeUi: null,
-  crashGuardInstalled: false,
-  initialSyncReady: false,
-  initInProgress: false,
-  standbyMode: false,
-  pendingChanges: new Set(),
-  watchTimer: null,
-  renderTimer: null,
-  tuiRef: null,
-  currentCtx: null,
-  purgeInterval: null,
-  probeInterval: null,
-  lastRemoteChangeTime: 0,
-  recentRemoteChanges: [],
-  pendingInstalls: new Set(),
-  installRunning: false,
-  peersAtInit: [],
-}));
+import {
+  hostname,
+  WATCH_DEBOUNCE_MS,
+  PURGE_INTERVAL_MS,
+  REFRESH_ICON_DURATION_MS,
+  RECENT_REMOTE_CHANGES_CAP,
+  state,
+} from "./state";
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
