@@ -36,7 +36,6 @@ import {
   type SyncedFile,
   type PiConfigDocument,
   type SyncConfig,
-  type Subdir,
   DEFAULT_SYNC_CONFIG,
   PI_DIR,
   CONFIG_DIR,
@@ -47,7 +46,7 @@ import {
   TOMBSTONE_TTL_MS,
   MASS_DELETE_LIMIT,
   normalizeFileKey,
-  fileKey,
+  fileKey as toFileKey,
   getSubdir,
   isLocalOnly,
   shouldSync,
@@ -182,16 +181,12 @@ function withSuppressedExport<T>(fn: () => T): T {
 
 // ── Trash helpers ────────────────────────────────────────────────────
 
-function trashPathFor(fileKey: string): string | null {
-  return trashPathForKey(fileKey);
-}
-
 /** Move PI_DIR/<key> → TRASH_DIR/<key>. Overwrites any prior trash copy. */
 function moveToTrash(fileKey: string): boolean {
   const src = piPathForKey(fileKey);
   if (!src) return false;
   if (!fs.existsSync(src)) return false;
-  const dest = trashPathFor(fileKey);
+  const dest = trashPathForKey(fileKey);
   if (!dest) return false;
   ensureDir(path.dirname(dest));
   try { fs.rmSync(dest, { force: true, recursive: true }); } catch {}
@@ -201,7 +196,7 @@ function moveToTrash(fileKey: string): boolean {
 
 /** Move TRASH_DIR/<key> → PI_DIR/<key>. */
 function restoreFromTrash(fileKey: string): boolean {
-  const src = trashPathFor(fileKey);
+  const src = trashPathForKey(fileKey);
   if (!src) return false;
   if (!fs.existsSync(src)) return false;
   const dest = piPathForKey(fileKey);
@@ -212,7 +207,7 @@ function restoreFromTrash(fileKey: string): boolean {
 }
 
 function purgeFromTrash(fileKey: string) {
-  const trashPath = trashPathFor(fileKey);
+  const trashPath = trashPathForKey(fileKey);
   if (!trashPath) return;
   try { fs.rmSync(trashPath, { force: true }); } catch {}
 }
@@ -538,7 +533,7 @@ function startFileWatcher() {
       ) return;
 
       const absPath = path.join(PI_DIR, filename);
-      const key = normalizeFileKey(fileKey(absPath));
+      const key = normalizeFileKey(toFileKey(absPath));
       if (!key || !shouldSync(key, state.config)) return;
       const subdir = getSubdir(key);
       if (!subdir) return;
