@@ -69,57 +69,76 @@ import {
 export type { SyncedFile, PiConfigDocument, SyncConfig };
 
 // ── Module-level state ────────────────────────────────────────────────
+//
+// pi loads extensions through jiti with `moduleCache: false`, so this
+// module is fully re-executed on every `/new` and `/reload`. Module-level
+// `let` bindings are reset to their defaults on each load, which made the
+// previous reentry guard inert (it checked vars in its own freshly-
+// initialized module instance, not the previous one's live state).
+//
+// To keep one source of truth across re-instantiations within a process,
+// all mutable runtime state lives on a singleton object stashed on
+// globalThis — see the `state` declaration further down, just after the
+// bare consts that are safe to re-evaluate on every load.
 
-let repo: any = null;
-let handle: any = null;
 let config: SyncConfig = { ...DEFAULT_SYNC_CONFIG };
-let wss: any = null;
-let watcher: fs.FSWatcher | null = null;
-let ImmutableString: any = null; // set during repo init
 const hostname = os.hostname();
-
-// Live connection tracking — two tiers:
-//  • wsConnectedPeers: actual WebSocket connections (inbound via wss, or outbound
-//    via active Automerge sync). Set by connection events, never by TCP probes.
-//  • tcpReachablePeers: peer port is open (best-effort via periodic TCP probe).
-const wsConnectedPeers = new Map<string, { since: number; direction: "in" | "out" }>();
-const tcpReachablePeers = new Set<string>();
-
-// Export guard: prevent fs.watch from re-importing files we're writing
-let exporting = false;
-let suppressExportDepth = 0;
-
-// Active session UI context (set in session_start). Module-scoped so the
-// uncaughtException crash guard can surface notifications to the user.
-let activeUi: ExtensionUIContext | null = null;
-let crashGuardInstalled = false;
-
-// Gate exports until the handle reaches the "ready" state (initial sync
-// loaded). Without this gate, incremental sync patches fire `change` for
-// each piece of an incoming snapshot and we end up writing a half-loaded
-// tree to disk — and if the peer is killed mid-stream, that partial tree
-// stays on disk after restart. Flipped by initRepo once the handle is
-// ready, then by every export afterwards.
-let initialSyncReady = false;
-let standbyMode = false; // true while waiting for primary instance to exit
-
-let pendingChanges = new Set<string>();
-let watchTimer: ReturnType<typeof setTimeout> | null = null;
-let renderTimer: ReturnType<typeof setInterval> | null = null;
-let tuiRef: any = null;
-let currentCtx: any = null;
-let purgeInterval: ReturnType<typeof setInterval> | null = null;
 const WATCH_DEBOUNCE_MS = 500;
 const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-// Remote-change tracking for the footer widget and /sync:status
-let lastRemoteChangeTime = 0;
-let recentRemoteChanges: string[] = [];
 const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
 
-// Track extension dirs whose files were written during an export batch.
-// Processed after the batch completes to run npm install if needed.
-const pendingInstalls = new Set<string>();
+type SyncState = {
+  repo: any;
+  handle: any;
+  wss: any;
+  watcher: fs.FSWatcher | null;
+  ImmutableString: any;
+  wsConnectedPeers: Map<string, { since: number; direction: "in" | "out" }>;
+  tcpReachablePeers: Set<string>;
+  exporting: boolean;
+  suppressExportDepth: number;
+  activeUi: ExtensionUIContext | null;
+  crashGuardInstalled: boolean;
+  initialSyncReady: boolean;
+  standbyMode: boolean;
+  pendingChanges: Set<string>;
+  watchTimer: ReturnType<typeof setTimeout> | null;
+  renderTimer: ReturnType<typeof setInterval> | null;
+  tuiRef: any;
+  currentCtx: any;
+  purgeInterval: ReturnType<typeof setInterval> | null;
+  probeInterval: ReturnType<typeof setInterval> | null;
+  lastRemoteChangeTime: number;
+  recentRemoteChanges: string[];
+  pendingInstalls: Set<string>;
+};
+
+const state: SyncState = ((globalThis as any).__piSyncState ??=
+  Object.seal({
+    repo: null,
+    handle: null,
+    wss: null,
+    watcher: null,
+    ImmutableString: null,
+    wsConnectedPeers: new Map(),
+    tcpReachablePeers: new Set(),
+    exporting: false,
+    suppressExportDepth: 0,
+    activeUi: null,
+    crashGuardInstalled: false,
+    initialSyncReady: false,
+    standbyMode: false,
+    pendingChanges: new Set(),
+    watchTimer: null,
+    renderTimer: null,
+    tuiRef: null,
+    currentCtx: null,
+    purgeInterval: null,
+    probeInterval: null,
+    lastRemoteChangeTime: 0,
+    recentRemoteChanges: [],
+    pendingInstalls: new Set(),
+  } as SyncState)) as SyncState;
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
@@ -145,20 +164,19 @@ async function probeAllPeers() {
       const port = parsed?.port ?? config.port;
       if (host === hostname) return;
       const ok = await probePeer(host, port);
-      if (ok) tcpReachablePeers.add(host);
-      else tcpReachablePeers.delete(host);
+      if (ok) state.tcpReachablePeers.add(host);
+      else state.tcpReachablePeers.delete(host);
     }),
   );
 }
 
-let probeInterval: ReturnType<typeof setInterval> | null = null;
 function startProbing() {
-  if (probeInterval) return;
+  if (state.probeInterval) return;
   probeAllPeers(); // immediate first probe
-  probeInterval = setInterval(probeAllPeers, 15_000); // every 15s
+  state.probeInterval = setInterval(probeAllPeers, 15_000); // every 15s
 }
 function stopProbing() {
-  if (probeInterval) { clearInterval(probeInterval); probeInterval = null; }
+  if (state.probeInterval) { clearInterval(state.probeInterval); state.probeInterval = null; }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -218,11 +236,11 @@ function trashPathForKey(fileKey: string): string | null {
 }
 
 function withSuppressedExport<T>(fn: () => T): T {
-  suppressExportDepth++;
+  state.suppressExportDepth++;
   try {
     return fn();
   } finally {
-    suppressExportDepth--;
+    state.suppressExportDepth--;
   }
 }
 
@@ -316,7 +334,7 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
   if (syncedFileContentMatches(existing, content)) return false;
 
   const entry: SyncedFile = {
-    content: ImmutableString ? new ImmutableString(content) : content,
+    content: state.ImmutableString ? new state.ImmutableString(content) : content,
     installedAt: existing?.installedAt ?? Date.now(),
   };
   if (existing?.source) entry.source = existing.source;
@@ -397,7 +415,7 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   atomicWriteFile(absPath, content);
   // Track extension dirs that need a dependency check post-export
   const extMatch = key.match(/^extensions\/([^/]+)\//);
-  if (extMatch) pendingInstalls.add(extMatch[1]);
+  if (extMatch) state.pendingInstalls.add(extMatch[1]);
   return true;
 }
 
@@ -418,8 +436,8 @@ function isDocEmpty(doc: PiConfigDocument): boolean {
  *  but no node_modules, run `npm install --ignore-scripts` so pi doesn't
  *  crash when loading the extension. */
 function installMissingExtensionDeps() {
-  if (pendingInstalls.size === 0) return;
-  for (const extName of pendingInstalls) {
+  if (state.pendingInstalls.size === 0) return;
+  for (const extName of state.pendingInstalls) {
     const extDir = path.join(PI_DIR, "extensions", extName);
     const pkgPath = path.join(extDir, "package.json");
     const nmDir = path.join(extDir, "node_modules");
@@ -442,11 +460,11 @@ function installMissingExtensionDeps() {
       );
     }
   }
-  pendingInstalls.clear();
+  state.pendingInstalls.clear();
 }
 
 function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
-  exporting = true;
+  state.exporting = true;
   try {
     let changed = false;
     for (const key of keys) {
@@ -455,7 +473,7 @@ function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
     installMissingExtensionDeps();
     return changed;
   } finally {
-    exporting = false;
+    state.exporting = false;
   }
 }
 
@@ -478,11 +496,11 @@ function exportAllFiles(doc: PiConfigDocument): boolean {
 async function flushPendingChanges() {
   // Skip if exporting to avoid feedback loop: export writes file →
   // watcher fires → import reads it back → another change cycle
-  if (!handle || exporting) return;
-  const files = [...pendingChanges];
-  pendingChanges.clear();
+  if (!state.handle || state.exporting) return;
+  const files = [...state.pendingChanges];
+  state.pendingChanges.clear();
 
-  const currentDoc = await handle.doc?.();
+  const currentDoc = await state.handle.doc?.();
   if (!currentDoc) return;
 
   // Partition into present (add/update) vs missing (potential delete).
@@ -524,7 +542,7 @@ async function flushPendingChanges() {
   }
 
   withSuppressedExport(() => {
-    handle.change?.((doc: PiConfigDocument) => {
+    state.handle.change?.((doc: PiConfigDocument) => {
       for (const key of present) {
         try {
           importFile(doc, key);
@@ -546,9 +564,9 @@ async function flushPendingChanges() {
 }
 
 function startFileWatcher() {
-  if (watcher) return;
+  if (state.watcher) return;
   try {
-    watcher = fs.watch(PI_DIR, { recursive: true }, (_eventType, filename) => {
+    state.watcher = fs.watch(PI_DIR, { recursive: true }, (_eventType, filename) => {
       if (!filename) return;
       if (
         filename.includes("node_modules") ||
@@ -579,9 +597,9 @@ function startFileWatcher() {
         // key → potential tombstone.
       }
 
-      pendingChanges.add(key);
-      if (watchTimer) clearTimeout(watchTimer);
-      watchTimer = setTimeout(flushPendingChanges, WATCH_DEBOUNCE_MS);
+      state.pendingChanges.add(key);
+      if (state.watchTimer) clearTimeout(state.watchTimer);
+      state.watchTimer = setTimeout(flushPendingChanges, WATCH_DEBOUNCE_MS);
     });
   } catch (err) {
     console.error("[pi-sync] fs.watch failed:", err);
@@ -589,8 +607,8 @@ function startFileWatcher() {
 }
 
 function stopFileWatcher() {
-  if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
-  if (watcher) { watcher.close(); watcher = null; }
+  if (state.watchTimer) { clearTimeout(state.watchTimer); state.watchTimer = null; }
+  if (state.watcher) { state.watcher.close(); state.watcher = null; }
 }
 
 // ── Tombstone TTL purge ──────────────────────────────────────────────
@@ -598,8 +616,8 @@ function stopFileWatcher() {
 /** Find and hard-delete tombstones older than TOMBSTONE_TTL_MS. Trash
  *  files for those entries are removed too. Returns count purged. */
 async function purgePastTTL(): Promise<number> {
-  if (!handle) return 0;
-  const doc = await handle.doc?.();
+  if (!state.handle) return 0;
+  const doc = await state.handle.doc?.();
   if (!doc) return 0;
   const now = Date.now();
   type Hit = { section: "extensions" | "skills" | "prompts"; key: string };
@@ -611,7 +629,7 @@ async function purgePastTTL(): Promise<number> {
     }
   }
   if (purgeable.length === 0) return 0;
-  handle.change?.((d: PiConfigDocument) => {
+  state.handle.change?.((d: PiConfigDocument) => {
     for (const p of purgeable) {
       const col = d[p.section] as Record<string, SyncedFile>;
       delete col[p.key];
@@ -623,13 +641,13 @@ async function purgePastTTL(): Promise<number> {
 }
 
 function startPurgeTimer() {
-  if (purgeInterval) return;
+  if (state.purgeInterval) return;
   purgePastTTL().catch(() => {});
-  purgeInterval = setInterval(() => { purgePastTTL().catch(() => {}); }, PURGE_INTERVAL_MS);
+  state.purgeInterval = setInterval(() => { purgePastTTL().catch(() => {}); }, PURGE_INTERVAL_MS);
 }
 
 function stopPurgeTimer() {
-  if (purgeInterval) { clearInterval(purgeInterval); purgeInterval = null; }
+  if (state.purgeInterval) { clearInterval(state.purgeInterval); state.purgeInterval = null; }
 }
 
 // ── Repo lifecycle ────────────────────────────────────────────────────
@@ -667,10 +685,10 @@ function quarantineStorage(): string | null {
  *  down the whole pi process. The guard keeps pi alive, stops sync, and
  *  quarantines storage so the next start is clean. */
 function installCrashGuard() {
-  if (crashGuardInstalled) return;
-  crashGuardInstalled = true;
+  if (state.crashGuardInstalled) return;
+  state.crashGuardInstalled = true;
 
-  const handle = (err: unknown, kind: "exception" | "rejection") => {
+  const onCrash = (err: unknown, kind: "exception" | "rejection") => {
     if (!isAutomergeError(err)) {
       // Log and swallow. Re-throwing here would re-enter this same handler
       // (uncaughtException loops on itself), so we leave the error to
@@ -686,11 +704,11 @@ function installCrashGuard() {
     const note =
       `pi-sync hit an Automerge crash and stopped.${dest ? `\nStorage quarantined → \`${dest}\`` : ""}\n` +
       `Run \`/reload\` to restart sync. If the crash recurs, run \`/sync:unlink\` and re-import from a peer.`;
-    try { activeUi?.notify(note, "warning"); } catch {}
+    try { state.activeUi?.notify(note, "warning"); } catch {}
   };
 
-  process.on("uncaughtException", (err) => handle(err, "exception"));
-  process.on("unhandledRejection", (reason) => handle(reason, "rejection"));
+  process.on("uncaughtException", (err) => onCrash(err, "exception"));
+  process.on("unhandledRejection", (reason) => onCrash(reason, "rejection"));
 }
 
 async function initRepo(pi: ExtensionAPI): Promise<void> {
@@ -710,15 +728,15 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     ]);
 
   // Store for use in importFile/exportFile
-  ImmutableString = IS;
+  state.ImmutableString = IS;
 
   const { NodeWSServerAdapter, WebSocketClientAdapter } = netModule;
 
   // ── WebSocket server ──────────────────────────────────────────────
 
-  wss = new WebSocketServer({ port: config.port });
+  state.wss = new WebSocketServer({ port: config.port });
 
-  wss.on("error", (err: NodeJS.ErrnoException) => {
+  state.wss.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
       console.error(
         `[pi-sync] Port ${config.port} is in use. ` +
@@ -730,16 +748,16 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   });
 
   // Track real WS connections (inbound = another peer connected to us)
-  wss.on("connection", (ws: any, req: any) => {
+  state.wss.on("connection", (ws: any, req: any) => {
     const remoteAddr = req.socket?.remoteAddress || "unknown";
     const host = remoteAddr.replace(/^::ffff:/, "");
-    wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
-    ws.on("close", () => wsConnectedPeers.delete(host));
+    state.wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
+    ws.on("close", () => state.wsConnectedPeers.delete(host));
   });
 
   // ── Network adapters ──────────────────────────────────────────────
 
-  const serverAdapter = new NodeWSServerAdapter(wss);
+  const serverAdapter = new NodeWSServerAdapter(state.wss);
   const adapters: any[] = [serverAdapter];
 
   for (const peer of config.peers) {
@@ -749,7 +767,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   // ── Create repo ───────────────────────────────────────────────────
 
-  repo = new Repo({
+  state.repo = new Repo({
     network: adapters,
     storage: new NodeFSStorageAdapter(AM_STORAGE),
     peerId: `pi-sync-${hostname}`,
@@ -763,10 +781,10 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     // Joining an existing network — find the document, then push our
     // local state so other peers learn about any extensions/skills
     // this machine has that they don't know about yet.
-    handle = await repo.find(docUrl);
+    state.handle = await state.repo.find(docUrl);
   } else {
     // First run — create fresh document, then import files one at a time
-    handle = repo.create({
+    state.handle = state.repo.create({
       settings: {},
       models: {},
       extensions: {},
@@ -779,12 +797,12 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       },
       lastSync: {},
     });
-    saveDocUrl(handle.url);
+    saveDocUrl(state.handle.url);
 
     // Import files incrementally to avoid WASM capacity overflow
     const files = collectAllFiles();
     for (const fileKey of files) {
-      handle.change((doc: PiConfigDocument) => {
+      state.handle.change((doc: PiConfigDocument) => {
         importFile(doc, fileKey);
       });
     }
@@ -792,27 +810,27 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   }
 
   // Attach the change listener BEFORE awaiting whenReady so we don't miss
-  // patches, but gate exports on `initialSyncReady`. Without the gate,
+  // patches, but gate exports on `state.initialSyncReady`. Without the gate,
   // each sync patch arriving mid-snapshot writes a partial tree to disk.
-  handle.on?.("change", (payload: any) => {
-    if (!initialSyncReady) return;
+  state.handle.on?.("change", (payload: any) => {
+    if (!state.initialSyncReady) return;
     const doc = payload?.doc;
     if (!doc) return;
-    if (suppressExportDepth > 0) return;
+    if (state.suppressExportDepth > 0) return;
     if (isDocEmpty(doc)) return;
     const patches: any[] = payload?.patches ?? [];
 
     // Track remote changes for the footer widget and /sync:status
-    lastRemoteChangeTime = Date.now();
+    state.lastRemoteChangeTime = Date.now();
     if (patches.length === 0) {
-      recentRemoteChanges = [];
+      state.recentRemoteChanges = [];
       exportAllFiles(doc);
       return;
     }
     const dirty = dirtyKeysFromPatches(patches);
-    // Deduplicate: only add keys not already in recentRemoteChanges
+    // Deduplicate: only add keys not already in state.recentRemoteChanges
     for (const k of dirty) {
-      if (!recentRemoteChanges.includes(k)) recentRemoteChanges.push(k);
+      if (!state.recentRemoteChanges.includes(k)) state.recentRemoteChanges.push(k);
     }
     exportKeys(doc, dirty);
   });
@@ -823,18 +841,18 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // If the join is interrupted (network drop, peer killed), whenReady
   // never resolves and nothing gets exported — disk stays clean.
   try {
-    await handle.whenReady?.();
+    await state.handle.whenReady?.();
   } catch (err: any) {
     console.error("[pi-sync] handle never became ready:", err?.message ?? err);
     return;
   }
 
-  const readyDoc = await handle.doc?.();
+  const readyDoc = await state.handle.doc?.();
   if (readyDoc) {
     // Push our local files into the doc now that we know the full remote
     // state, so peers learn about anything we have that they don't.
     withSuppressedExport(() => {
-      handle.change?.((doc: PiConfigDocument) => {
+      state.handle.change?.((doc: PiConfigDocument) => {
         importAllFiles(doc);
         doc.lastSync[hostname] = Date.now();
       });
@@ -846,42 +864,42 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       exportAllFiles(readyDoc);
     }
   }
-  initialSyncReady = true;
+  state.initialSyncReady = true;
 }
 
 async function shutdownRepo() {
   stopFileWatcher();
   stopProbing();
   stopPurgeTimer();
-  if (renderTimer) { clearInterval(renderTimer); renderTimer = null; }
-  wsConnectedPeers.clear();
-  tcpReachablePeers.clear();
-  initialSyncReady = false;
-  if (repo) {
-    try { await repo.shutdown?.(); } catch {}
+  if (state.renderTimer) { clearInterval(state.renderTimer); state.renderTimer = null; }
+  state.wsConnectedPeers.clear();
+  state.tcpReachablePeers.clear();
+  state.initialSyncReady = false;
+  if (state.repo) {
+    try { await state.repo.shutdown?.(); } catch {}
   }
-  if (wss) {
+  if (state.wss) {
     try {
-      // wss.close() only stops accepting new connections — existing
+      // state.wss.close() only stops accepting new connections — existing
       // clients stay connected. Terminate them so the standby WebSocket
       // in watchAndTakeOver detects the close and can take over.
-      for (const client of wss.clients) {
+      for (const client of state.wss.clients) {
         try { client.terminate(); } catch {}
       }
       await new Promise<void>((resolve, reject) => {
-        wss.close((err?: Error) => (err ? reject(err) : resolve()));
+        state.wss.close((err?: Error) => (err ? reject(err) : resolve()));
       });
     } catch {}
-    wss = null;
+    state.wss = null;
   }
-  repo = null;
-  handle = null;
+  state.repo = null;
+  state.handle = null;
 }
 
 // ── Watchdog: waits for the primary instance to exit, then takes over ─
 
 async function watchAndTakeOver(pi: ExtensionAPI) {
-  standbyMode = true;
+  state.standbyMode = true;
   const { default: WebSocket } = await import("ws");
   await new Promise<void>((resolve) => {
     const ws = new WebSocket(`ws://localhost:${config.port}`);
@@ -905,13 +923,13 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
     return;
   }
 
-  standbyMode = false;
+  state.standbyMode = false;
   await initRepo(pi);
 
   // Re-render the footer immediately after takeover so the TUI
   // layout re-flows and the footer line doesn't appear off by one.
   // (Otherwise the user waits up to 5 s for the next timer tick.)
-  tuiRef?.requestRender();
+  state.tuiRef?.requestRender();
 
   // Kick off the runtime loops that initRepo normally starts under the
   // non-standby path (watcher, probing, purge).
@@ -945,7 +963,7 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("sync:status", {
     description: "Show pi-sync status, peers, and sync toggles",
     handler: async (_args, ctx) => {
-      const doc = handle ? await handle.doc?.() : undefined;
+      const doc = state.handle ? await state.handle.doc?.() : undefined;
       const docUrl = loadDocUrl();
       const onOff = (b: boolean) => b ? "✅" : "❌";
       const lines = [
@@ -956,7 +974,7 @@ export default async function (pi: ExtensionAPI) {
         ...(config.peers.length > 0
           ? config.peers.map((p) => {
               const h = peerHost(p);
-              const mark = wsConnectedPeers.has(h) ? "🟢" : tcpReachablePeers.has(h) ? "🔵" : "🔴";
+              const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
               return `  ${mark} \`${p}\``;
             })
           : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
@@ -969,16 +987,16 @@ export default async function (pi: ExtensionAPI) {
       ];
 
       // Recent remote changes
-      if (recentRemoteChanges.length > 0 && Date.now() - lastRemoteChangeTime < REFRESH_ICON_DURATION_MS) {
-        const ago = Math.round((Date.now() - lastRemoteChangeTime) / 1000);
+      if (state.recentRemoteChanges.length > 0 && Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS) {
+        const ago = Math.round((Date.now() - state.lastRemoteChangeTime) / 1000);
         const agoStr = ago < 10 ? "just now" : `${ago}s ago`;
         lines.push(``);
-        lines.push(`🔄 Last sync (${agoStr}) — ${recentRemoteChanges.length} change(s):`);
-        for (const k of recentRemoteChanges.slice(0, 15)) {
+        lines.push(`🔄 Last sync (${agoStr}) — ${state.recentRemoteChanges.length} change(s):`);
+        for (const k of state.recentRemoteChanges.slice(0, 15)) {
           lines.push(`    \`${k}\``);
         }
-        if (recentRemoteChanges.length > 15) {
-          lines.push(`    … and ${recentRemoteChanges.length - 15} more`);
+        if (state.recentRemoteChanges.length > 15) {
+          lines.push(`    … and ${state.recentRemoteChanges.length - 15} more`);
         }
       }
 
@@ -1002,7 +1020,7 @@ export default async function (pi: ExtensionAPI) {
         } else {
           const list = config.peers.map((p) => {
             const h = peerHost(p);
-            const mark = wsConnectedPeers.has(h) ? "🟢" : tcpReachablePeers.has(h) ? "🔵" : "🔴";
+            const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
             return `  ${mark} \`${p}\``;
           }).join("\n");
           ctx.ui.notify(`**Peers (${config.peers.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
@@ -1048,8 +1066,8 @@ export default async function (pi: ExtensionAPI) {
         if (config.peers.length === before) {
           ctx.ui.notify(`Peer \`${target}\` not found.`, "info");
         } else {
-          wsConnectedPeers.delete(targetHost);
-          tcpReachablePeers.delete(targetHost);
+          state.wsConnectedPeers.delete(targetHost);
+          state.tcpReachablePeers.delete(targetHost);
           saveConfig();
           ctx.ui.notify(`Removed \`${target}\` from peers.`, "info");
         }
@@ -1293,11 +1311,11 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("sync:trash", {
     description: "Review and manage soft-deleted files (tombstones)",
     handler: async (args, ctx) => {
-      if (!handle) {
+      if (!state.handle) {
         ctx.ui.notify("pi-sync not initialized yet", "info");
         return;
       }
-      const doc = await handle.doc?.();
+      const doc = await state.handle.doc?.();
       if (!doc) {
         ctx.ui.notify("Document not ready yet", "info");
         return;
@@ -1348,7 +1366,7 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify(`No tombstone for \`${fileArg}\`.`, "info");
           return;
         }
-        handle.change?.((d: PiConfigDocument) => {
+        state.handle.change?.((d: PiConfigDocument) => {
           const col = d[hit.section] as Record<string, SyncedFile>;
           const e = col[fileArg];
           if (e) { delete e.deletedAt; delete e.deletedBy; }
@@ -1365,7 +1383,7 @@ export default async function (pi: ExtensionAPI) {
             ctx.ui.notify(`No tombstone for \`${fileArg}\`.`, "info");
             return;
           }
-          handle.change?.((d: PiConfigDocument) => {
+          state.handle.change?.((d: PiConfigDocument) => {
             const col = d[hit.section] as Record<string, SyncedFile>;
             delete col[fileArg];
           });
@@ -1397,11 +1415,11 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("sync:local-only", {
     description: "Manage local-only files (add/remove/list)",
     handler: async (args, ctx) => {
-      if (!handle) {
+      if (!state.handle) {
         ctx.ui.notify("pi-sync not initialized yet", "info");
         return;
       }
-      const doc = await handle.doc?.();
+      const doc = await state.handle.doc?.();
       if (!doc) {
         ctx.ui.notify("Document not ready yet", "info");
         return;
@@ -1423,7 +1441,7 @@ export default async function (pi: ExtensionAPI) {
 
       if (action === "add" && fileArg) {
         const targetHost = parts[2] || hostname;
-        handle.change?.((d: PiConfigDocument) => {
+        state.handle.change?.((d: PiConfigDocument) => {
           if (!d.localOnly[fileArg]) d.localOnly[fileArg] = [];
           if (!d.localOnly[fileArg].includes(targetHost)) {
             d.localOnly[fileArg].push(targetHost);
@@ -1434,7 +1452,7 @@ export default async function (pi: ExtensionAPI) {
       }
 
       if (action === "remove" && fileArg) {
-        handle.change?.((d: PiConfigDocument) => {
+        state.handle.change?.((d: PiConfigDocument) => {
           delete d.localOnly[fileArg];
         });
         ctx.ui.notify(`Removed local-only from \`${fileArg}\``, "info");
@@ -1451,30 +1469,30 @@ export default async function (pi: ExtensionAPI) {
   // ── Sync label helper ────────────────────────────────────────────
 
   function getSyncLabel(): string {
-    if (standbyMode) return "⛓️  standby";
+    if (state.standbyMode) return "⛓️  standby";
     const total = config.peers.length;
-    const wsOnline = config.peers.filter((p) => wsConnectedPeers.has(peerHost(p))).length;
-    const showRefresh = Date.now() - lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
+    const wsOnline = config.peers.filter((p) => state.wsConnectedPeers.has(peerHost(p))).length;
+    const showRefresh = Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
 
     let label: string;
     if (total === 0) label = "🔗";
     else if (wsOnline > 0) label = `🔗 ${wsOnline}`;
     else label = `🔗 ${total}`;
 
-    if (showRefresh && recentRemoteChanges.length > 0) label += ` 🔄`;
+    if (showRefresh && state.recentRemoteChanges.length > 0) label += ` 🔄`;
     return label;
   }
 
   // ── Custom footer timer (triggers re-render every 5s) ────────────
 
   function startRenderTimer() {
-    if (renderTimer) return;
-    renderTimer = setInterval(() => {
-      tuiRef?.requestRender();
+    if (state.renderTimer) return;
+    state.renderTimer = setInterval(() => {
+      state.tuiRef?.requestRender();
     }, 5000);
   }
   function stopRenderTimer() {
-    if (renderTimer) { clearInterval(renderTimer); renderTimer = null; }
+    if (state.renderTimer) { clearInterval(state.renderTimer); state.renderTimer = null; }
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────
@@ -1482,20 +1500,20 @@ export default async function (pi: ExtensionAPI) {
   // waiting for takeover).
 
   pi.on("session_start", async (_event, ctx) => {
-    activeUi = ctx.ui;
-    currentCtx = ctx;
+    state.activeUi = ctx.ui;
+    state.currentCtx = ctx;
 
     // ── Custom footer: cwd+branch left, pi-sync label right on line 1 ──
     ctx.ui.setFooter((tui, theme, footerData) => {
-      tuiRef = tui;
+      state.tuiRef = tui;
       const unsub = footerData.onBranchChange(() => tui.requestRender());
       startRenderTimer();
 
       return {
-        dispose() { unsub(); stopRenderTimer(); tuiRef = null; },
+        dispose() { unsub(); stopRenderTimer(); state.tuiRef = null; },
         invalidate() {},
         render(width: number): string[] {
-          const liveCtx = currentCtx;
+          const liveCtx = state.currentCtx;
           if (!liveCtx) return ["", ""];
 
           // ── Line 1: cwd + branch left, sync label right ──
@@ -1548,12 +1566,12 @@ export default async function (pi: ExtensionAPI) {
       };
     });
 
-    if (!handle) return;
-    const doc = await handle.doc?.();
+    if (!state.handle) return;
+    const doc = await state.handle.doc?.();
     if (!doc) return;
 
     withSuppressedExport(() => {
-      handle.change?.((d: PiConfigDocument) => {
+      state.handle.change?.((d: PiConfigDocument) => {
         importAllFiles(d);
       });
     });
@@ -1565,15 +1583,15 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     stopProbing();
     ctx.ui.setFooter(undefined);
-    currentCtx = null;
-    tuiRef = null;
-    if (activeUi === ctx.ui) activeUi = null;
-    if (handle) {
-      const doc = await handle.doc?.();
+    state.currentCtx = null;
+    state.tuiRef = null;
+    if (state.activeUi === ctx.ui) state.activeUi = null;
+    if (state.handle) {
+      const doc = await state.handle.doc?.();
       if (doc) {
         try {
           withSuppressedExport(() => {
-            handle.change?.((d: PiConfigDocument) => {
+            state.handle.change?.((d: PiConfigDocument) => {
               importAllFiles(d);
               d.lastSync[hostname] = Date.now();
             });
@@ -1588,13 +1606,16 @@ export default async function (pi: ExtensionAPI) {
 
   // ── Start syncing (or wait for takeover) ──────────────────────────
   //
-  // Re-entry guards: when extensions are reloaded within the same
-  // process (e.g. /new creates a fresh ResourceLoader), module-level
-  // state persists. Two guards:
-  //   1. standbyMode — a watchAndTakeOver is already in flight, don't
-  //      interfere (it will handle takeover and set standbyMode=false).
-  //   2. handle — repo already initialized, just restart watchers.
-  if (standbyMode || handle) return;
+  // Re-entry guard: when pi reloads extensions inside the same process
+  // (e.g. on `/new`), the module body re-executes against the singleton
+  // `state` on globalThis. Two flags say "the previous instance still
+  // owns this process":
+  //   1. state.standbyMode — a watchAndTakeOver is already in flight,
+  //      don't interfere (it will set state.standbyMode=false on takeover).
+  //   2. state.handle — repo already initialized, port already bound.
+  // Without this, probePeer below finds our own previous wss, calls
+  // watchAndTakeOver, and we self-reenter standby forever.
+  if (state.standbyMode || state.handle) return;
 
   if (await probePeer("localhost", config.port, 500)) {
     // Background watchdog — pi continues immediately, widget shows status.
