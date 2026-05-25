@@ -33,7 +33,6 @@ import { Container, type SettingItem, SettingsList, Text, truncateToWidth, visib
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { execSync } from "node:child_process";
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -117,6 +116,7 @@ type SyncState = {
   lastRemoteChangeTime: number;
   recentRemoteChanges: string[];
   pendingInstalls: Set<string>;
+  installRunning: boolean;
 };
 
 // Symbol key so we don't collide with anyone else stashing things on
@@ -151,6 +151,7 @@ const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
   lastRemoteChangeTime: 0,
   recentRemoteChanges: [],
   pendingInstalls: new Set(),
+  installRunning: false,
 }));
 
 // ── Peer probing ─────────────────────────────────────────────────────
@@ -447,33 +448,51 @@ function isDocEmpty(doc: PiConfigDocument): boolean {
 /** After exporting a batch of files, check any extension dirs that had
  *  files written. If the extension has a package.json with dependencies
  *  but no node_modules, run `npm install --ignore-scripts` so pi doesn't
- *  crash when loading the extension. */
-function installMissingExtensionDeps() {
+ *  crash when loading the extension.
+ *
+ *  Fire-and-forget: `exec` (not `execSync`) so the Automerge change-
+ *  handler path doesn't block the event loop for up to 60 s × N. Single
+ *  in-flight guard on state so a /new triggering a parallel module load
+ *  doesn't kick off a second installer for the same dir. */
+async function installMissingExtensionDeps(): Promise<void> {
+  if (state.installRunning) return;
   if (state.pendingInstalls.size === 0) return;
-  for (const extName of state.pendingInstalls) {
-    const extDir = path.join(PI_DIR, "extensions", extName);
-    const pkgPath = path.join(extDir, "package.json");
-    const nmDir = path.join(extDir, "node_modules");
-    try {
-      if (!fs.existsSync(pkgPath)) continue;
-      if (fs.existsSync(nmDir)) continue;
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-      if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) continue;
-      console.log(`[pi-sync] Installing deps for ${extName}…`);
-      execSync("npm install --ignore-scripts", {
-        cwd: extDir,
-        stdio: "pipe",
-        timeout: 60_000,
-      });
-      console.log(`[pi-sync] Dependencies installed for ${extName}`);
-    } catch (err: any) {
-      console.error(
-        `[pi-sync] Failed to install deps for ${extName}:`,
-        err?.message ?? err,
-      );
+  state.installRunning = true;
+  try {
+    const { exec } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execAsync = promisify(exec);
+    // Drain on each pass — new entries can be added while we run, and the
+    // outer loop picks them up before we release the in-flight flag.
+    while (state.pendingInstalls.size > 0) {
+      const batch = [...state.pendingInstalls];
+      state.pendingInstalls.clear();
+      for (const extName of batch) {
+        const extDir = path.join(PI_DIR, "extensions", extName);
+        const pkgPath = path.join(extDir, "package.json");
+        const nmDir = path.join(extDir, "node_modules");
+        try {
+          if (!fs.existsSync(pkgPath)) continue;
+          if (fs.existsSync(nmDir)) continue;
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+          if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) continue;
+          console.log(`[pi-sync] Installing deps for ${extName}…`);
+          await execAsync("npm install --ignore-scripts", {
+            cwd: extDir,
+            timeout: 60_000,
+          });
+          console.log(`[pi-sync] Dependencies installed for ${extName}`);
+        } catch (err: any) {
+          console.error(
+            `[pi-sync] Failed to install deps for ${extName}:`,
+            err?.message ?? err,
+          );
+        }
+      }
     }
+  } finally {
+    state.installRunning = false;
   }
-  state.pendingInstalls.clear();
 }
 
 function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
@@ -483,7 +502,9 @@ function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
     for (const key of keys) {
       if (exportFile(doc, key)) changed = true;
     }
-    installMissingExtensionDeps();
+    // Fire-and-forget; runs npm install in the background so the change-
+    // handler path returns immediately.
+    void installMissingExtensionDeps();
     return changed;
   } finally {
     state.exporting = false;
