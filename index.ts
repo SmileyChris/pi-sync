@@ -17,8 +17,7 @@
  *
  * Commands:
  *   /sync:status       – show sync state, peers, document info
- *   /sync:info         – show your document URL (share this to pair)
- *   /sync:invite       – alias for /sync:info
+ *   /sync:info         – show document URL and pairing instructions
  *   /sync:import <url> – join an existing sync network
  *   /sync:unlink       – detach from the sync network
  *   /sync:peers        – manage peer list (add/remove/list/scan)
@@ -818,20 +817,41 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   const { default: WebSocket } = await import("ws");
   await new Promise<void>((resolve) => {
     const ws = new WebSocket(`ws://localhost:${config.port}`);
-    ws.on("close", () => {
-      console.log(
-        `[pi-sync] Primary instance exited — taking over port ${config.port}`,
-      );
-      resolve();
-    });
+    ws.on("close", () => resolve());
     ws.on("error", () => resolve());
   });
+
+  // Jitter: wait 50–500 ms before attempting to take over so multiple
+  // standbys don't race for the port at the exact same instant.
+  const jitterMs = Math.floor(Math.random() * 450) + 50;
+  await new Promise((r) => setTimeout(r, jitterMs));
+
+  // Did another standby already claim the port while we waited?
+  if (await probePeer("localhost", config.port, 500)) {
+    console.log(
+      `[pi-sync] Another instance took port ${config.port} — resuming standby`,
+    );
+    watchAndTakeOver(pi).catch((e: any) =>
+      console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+    );
+    return;
+  }
+
   standbyMode = false;
   await initRepo(pi);
-  // If we just took over, kick off the runtime loops that initRepo
-  // normally starts (watcher, probing, purge). These would have been
-  // started by the session_start handler if a session is already active,
-  // but call them here just in case.
+
+  // Refresh the status widget immediately after takeover so the TUI
+  // layout re-flows and the footer line doesn't appear off by one.
+  // (Otherwise the user waits up to 5 s for the next timer tick.)
+  if (activeUi && handle) {
+    try {
+      const doc = await handle.doc?.();
+      updateStatusWidget(doc);
+    } catch {}
+  }
+
+  // Kick off the runtime loops that initRepo normally starts under the
+  // non-standby path (watcher, probing, purge).
   startFileWatcher();
   startPurgeTimer();
   startProbing();
@@ -1105,58 +1125,33 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
+  const showInviteInfo = async (ctx: { ui: ExtensionUIContext }) => {
+    const docUrl = loadDocUrl();
+    if (!docUrl) {
+      ctx.ui.notify("No document yet — waiting for repo to initialize.", "info");
+      return;
+    }
+    const lines = [
+      `**pi-sync invite**`,
+      ``,
+      `Your join key (share this with the other machine):`,
+      ``,
+      `\`${docUrl}\``,
+      ``,
+      `**On the other machine:**`,
+      `1. Install pi-sync (same setup as this machine)`,
+      `2. \`/sync:peers add ${hostname}:${config.port}\``,
+      `3. \`/sync:import ${docUrl}\``,
+      `4. \`/reload\``,
+      ``,
+      `They'll automatically pull all synced extensions and skills.`,
+    ];
+    ctx.ui.notify(lines.join("\n"), "info");
+  };
+
   pi.registerCommand("sync:info", {
     description: "Show invite key and instructions for pairing machines",
-    handler: async (_args, ctx) => {
-      const docUrl = loadDocUrl();
-      if (!docUrl) {
-        ctx.ui.notify("No document yet — waiting for repo to initialize.", "info");
-        return;
-      }
-      const lines = [
-        `**pi-sync invite**`,
-        ``,
-        `Your join key (share this with the other machine):`,
-        ``,
-        `\`${docUrl}\``,
-        ``,
-        `**On the other machine:**`,
-        `1. Install pi-sync: same setup as this machine`,
-        `2. \`/sync:peers add ${hostname}:${config.port}\``,
-        `3. \`/sync:import ${docUrl}\``,
-        `4. \`/reload\``,
-        ``,
-        `They'll automatically pull all synced extensions and skills.`,
-      ];
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
-
-  // Alias for /sync:info
-  pi.registerCommand("sync:invite", {
-    description: "Show invite key for pairing a new machine",
-    handler: async (_args, ctx) => {
-      const docUrl = loadDocUrl();
-      if (!docUrl) {
-        ctx.ui.notify("No document yet — waiting for repo to initialize.", "info");
-        return;
-      }
-      const lines = [
-        `**pi-sync invite**`,
-        ``,
-        `Your join key:`,
-        ``,
-        `\`${docUrl}\``,
-        ``,
-        `**On the other machine:**`,
-        `1. Install pi-sync (clone extension dir + npm install)`,
-        `2. \`/sync:peers add ${hostname}:${config.port}\``,
-        `3. \`/sync:import ${docUrl}\` then \`/reload\``,
-        ``,
-        `They'll pull all synced config, extensions, and skills.`,
-      ];
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
+    handler: async (_args, ctx) => showInviteInfo(ctx),
   });
 
   pi.registerCommand("sync:import", {
