@@ -15,6 +15,7 @@ import {
   isPiSyncExtensionKey,
   fileKey,
   getSubdir,
+  isSupportedFileKey,
   isLocalOnlyByMap,
   isLocalOnly,
   shouldSync,
@@ -253,6 +254,31 @@ describe("shouldSync", () => {
 
   it("never syncs pi-sync itself", () => {
     expect(shouldSync("extensions/pi-sync/index.ts", DEFAULT_SYNC_CONFIG)).toBe(false);
+  });
+
+  it.each([
+    "extensions/foo/runtime.db",
+    "extensions/foo/notes.txt",
+    "extensions/foo/node_modules/dep/index.ts",
+    "extensions/foo/.cache/index.ts",
+    "skills/foo/script.ts",
+    "skills/foo/.cache/notes.md",
+    "prompts/foo/data.json",
+    "prompts/foo/.cache/system.md",
+  ])("rejects unsupported or skipped file key %s", (key) => {
+    expect(isSupportedFileKey(key)).toBe(false);
+    expect(shouldSync(key, DEFAULT_SYNC_CONFIG)).toBe(false);
+  });
+
+  it.each([
+    "extensions/foo/index.ts",
+    "extensions/foo/assets/icon.svg",
+    "skills/foo/SKILL.md",
+    "prompts/foo/system.md",
+    "prompts/foo/plain.txt",
+  ])("accepts supported file key %s", (key) => {
+    expect(isSupportedFileKey(key)).toBe(true);
+    expect(shouldSync(key, DEFAULT_SYNC_CONFIG)).toBe(true);
   });
 });
 

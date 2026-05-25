@@ -109,6 +109,37 @@ export function getSubdir(fileKey: string): Subdir | null {
   return null;
 }
 
+const EXTENSION_EXTS = [
+  ".ts", ".js", ".css", ".json", ".wasm", ".html",
+  ".svg", ".png", ".jpg", ".woff2", ".md",
+] as const;
+
+const SKILL_EXTS = [".md"] as const;
+const PROMPT_EXTS = [".md", ".txt"] as const;
+
+function hasAllowedSuffix(fileKey: string, exts: readonly string[]): boolean {
+  return exts.some((ext) => fileKey.endsWith(ext));
+}
+
+function hasSkippedCollectionDir(fileKey: string): boolean {
+  const parts = fileKey.split("/");
+  return parts.slice(1, -1).some((part) => part === "node_modules" || part.startsWith("."));
+}
+
+export function isSupportedFileKey(fileKey: string): boolean {
+  const key = normalizeFileKey(fileKey);
+  if (!key) return false;
+  const subdir = getSubdir(key);
+  if (subdir === "settings") return key === "settings.json";
+  if (subdir === "models") return key === "models.json";
+  if (!subdir) return false;
+  if (hasSkippedCollectionDir(key)) return false;
+  if (subdir === "extensions") return !isPiSyncExtensionKey(key) && hasAllowedSuffix(key, EXTENSION_EXTS);
+  if (subdir === "skills") return hasAllowedSuffix(key, SKILL_EXTS);
+  if (subdir === "prompts") return hasAllowedSuffix(key, PROMPT_EXTS);
+  return false;
+}
+
 /**
  * A file is local-only *for the active host* when the map lists one or
  * more hosts but does not include activeHost. Empty array = local-only
@@ -154,7 +185,7 @@ const SUBDIR_TO_TOGGLE: Record<Subdir, keyof SyncConfig> = {
 };
 
 export function shouldSync(fileKey: string, config: SyncConfig): boolean {
-  if (isPiSyncExtensionKey(fileKey)) return false;
+  if (!isSupportedFileKey(fileKey)) return false;
   const subdir = getSubdir(fileKey);
   if (!subdir) return false;
   return config[SUBDIR_TO_TOGGLE[subdir]] as boolean;
@@ -205,11 +236,6 @@ function walkCollect(
   return out;
 }
 
-const EXTENSION_EXTS = [
-  ".ts", ".js", ".css", ".json", ".wasm", ".html",
-  ".svg", ".png", ".jpg", ".woff2", ".md",
-] as const;
-
 export function collectExtensionFiles(
   extDir: string,
   readdirSync: (dir: string) => fsDirEntry[],
@@ -227,7 +253,7 @@ export function collectSkillFiles(
 ): string[] {
   return walkCollect(
     skillsDir,
-    { skipDirs: new Set(["node_modules"]), exts: [".md"], names: ["SKILL.md"] },
+    { skipDirs: new Set(["node_modules"]), exts: SKILL_EXTS, names: ["SKILL.md"] },
     readdirSync,
   );
 }
@@ -238,7 +264,7 @@ export function collectPromptFiles(
 ): string[] {
   return walkCollect(
     promptsDir,
-    { skipDirs: new Set(["node_modules"]), exts: [".md", ".txt"] },
+    { skipDirs: new Set(["node_modules"]), exts: PROMPT_EXTS },
     readdirSync,
   );
 }
