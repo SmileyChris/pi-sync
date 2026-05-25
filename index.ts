@@ -100,6 +100,11 @@ type SyncState = {
   activeUi: ExtensionUIContext | null;
   crashGuardInstalled: boolean;
   initialSyncReady: boolean;
+  // True from entry into initRepo (or from probePeer at the bottom of the
+  // entry point) until the resulting handle / standby state is observable
+  // to the next module load. Closes the race where a `/new` fires inside
+  // initRepo's async gap before state.wss / state.handle exist.
+  initInProgress: boolean;
   standbyMode: boolean;
   pendingChanges: Set<string>;
   watchTimer: ReturnType<typeof setTimeout> | null;
@@ -127,6 +132,7 @@ const state: SyncState = ((globalThis as any).__piSyncState ??=
     activeUi: null,
     crashGuardInstalled: false,
     initialSyncReady: false,
+    initInProgress: false,
     standbyMode: false,
     pendingChanges: new Set(),
     watchTimer: null,
@@ -712,6 +718,9 @@ function installCrashGuard() {
 }
 
 async function initRepo(pi: ExtensionAPI): Promise<void> {
+  // Synchronous guard set before any await — see SyncState.initInProgress.
+  state.initInProgress = true;
+  try {
   ensureDir(CONFIG_DIR);
   ensureDir(AM_STORAGE);
   ensureDir(TRASH_DIR);
@@ -865,6 +874,9 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     }
   }
   state.initialSyncReady = true;
+  } finally {
+    state.initInProgress = false;
+  }
 }
 
 async function shutdownRepo() {
@@ -1608,29 +1620,41 @@ export default async function (pi: ExtensionAPI) {
   //
   // Re-entry guard: when pi reloads extensions inside the same process
   // (e.g. on `/new`), the module body re-executes against the singleton
-  // `state` on globalThis. Two flags say "the previous instance still
+  // `state` on globalThis. Three flags say "the previous instance still
   // owns this process":
   //   1. state.standbyMode — a watchAndTakeOver is already in flight,
   //      don't interfere (it will set state.standbyMode=false on takeover).
   //   2. state.handle — repo already initialized, port already bound.
+  //   3. state.initInProgress — initRepo or the probePeer dispatch below
+  //      is mid-flight; state.handle / state.standbyMode aren't observable
+  //      yet but will be by the time this flag clears.
   // Without this, probePeer below finds our own previous wss, calls
   // watchAndTakeOver, and we self-reenter standby forever.
-  if (state.standbyMode || state.handle) return;
+  if (state.standbyMode || state.handle || state.initInProgress) return;
 
-  if (await probePeer("localhost", config.port, 500)) {
-    // Background watchdog — pi continues immediately, widget shows status.
-    // When the other instance exits it terminates all clients, causing
-    // watchAndTakeOver's WebSocket to close and auto-take-over.
-    watchAndTakeOver(pi).catch((e: any) =>
-      console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
-    );
-  } else {
-    try {
+  // Mark sync so a parallel reload that lands inside the probePeer await
+  // (or before initRepo's own marker takes effect) sees us as in-progress
+  // and bails out via the guard above.
+  state.initInProgress = true;
+  try {
+    if (await probePeer("localhost", config.port, 500)) {
+      // Background watchdog — pi continues immediately, widget shows status.
+      // When the other instance exits it terminates all clients, causing
+      // watchAndTakeOver's WebSocket to close and auto-take-over.
+      // watchAndTakeOver's first synchronous step sets state.standbyMode,
+      // so the guard takes over from initInProgress as soon as the .catch
+      // below returns.
+      watchAndTakeOver(pi).catch((e: any) =>
+        console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+      );
+    } else {
       await initRepo(pi);
       startFileWatcher();
       startPurgeTimer();
-    } catch (e: any) {
-      console.error("[pi-sync] Failed to initialize sync repo:", e.message);
     }
+  } catch (e: any) {
+    console.error("[pi-sync] Failed to initialize sync repo:", e?.message ?? e);
+  } finally {
+    state.initInProgress = false;
   }
 }
