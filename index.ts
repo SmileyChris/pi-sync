@@ -82,13 +82,13 @@ export type { SyncedFile, PiConfigDocument, SyncConfig };
 // globalThis — see the `state` declaration further down, just after the
 // bare consts that are safe to re-evaluate on every load.
 
-let config: SyncConfig = { ...DEFAULT_SYNC_CONFIG };
 const hostname = os.hostname();
 const WATCH_DEBOUNCE_MS = 500;
 const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
 
 type SyncState = {
+  config: SyncConfig;
   repo: any;
   handle: any;
   wss: any;
@@ -126,6 +126,7 @@ const STATE_KEY = Symbol.for("pi-sync:state");
 type StateHost = typeof globalThis & { [STATE_KEY]?: SyncState };
 
 const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
+  config: { ...DEFAULT_SYNC_CONFIG },
   repo: null,
   handle: null,
   wss: null,
@@ -170,10 +171,10 @@ async function probePeer(host: string, port: number, timeoutMs = 2000): Promise<
 /** TCP-probe all configured peers in parallel (best-effort reachability). */
 async function probeAllPeers() {
   await Promise.allSettled(
-    config.peers.map(async (peer) => {
+    state.config.peers.map(async (peer) => {
       const parsed = parsePeer(peer);
       const host = parsed?.host ?? peerHost(peer);
-      const port = parsed?.port ?? config.port;
+      const port = parsed?.port ?? state.config.port;
       if (host === hostname) return;
       const ok = await probePeer(host, port);
       if (ok) state.tcpReachablePeers.add(host);
@@ -320,7 +321,7 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
   if (!key) return false;
   const subdir = getSubdir(key);
   if (!subdir) return false;
-  if (!shouldSync(key, config)) return false;
+  if (!shouldSync(key, state.config)) return false;
   if (isLocalOnly(doc, key, hostname)) return false;
 
   const absPath = piPathForKey(key);
@@ -358,21 +359,21 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
 function collectAllFiles(): string[] {
   const files: string[] = [];
 
-  if (config.syncSettings && fs.existsSync(path.join(PI_DIR, "settings.json")))
+  if (state.config.syncSettings && fs.existsSync(path.join(PI_DIR, "settings.json")))
     files.push("settings.json");
-  if (config.syncModels && fs.existsSync(path.join(PI_DIR, "models.json")))
+  if (state.config.syncModels && fs.existsSync(path.join(PI_DIR, "models.json")))
     files.push("models.json");
 
   const extDir = path.join(PI_DIR, "extensions");
-  if (config.syncExtensions && fs.existsSync(extDir)) {
+  if (state.config.syncExtensions && fs.existsSync(extDir)) {
     files.push(...collectExtensionFiles(extDir, readEntries));
   }
   const skillsDir = path.join(PI_DIR, "skills");
-  if (config.syncSkills && fs.existsSync(skillsDir)) {
+  if (state.config.syncSkills && fs.existsSync(skillsDir)) {
     files.push(...collectSkillFiles(skillsDir, readEntries));
   }
   const promptsDir = path.join(PI_DIR, "prompts");
-  if (config.syncPrompts && fs.existsSync(promptsDir)) {
+  if (state.config.syncPrompts && fs.existsSync(promptsDir)) {
     files.push(...collectPromptFiles(promptsDir, readEntries));
   }
 
@@ -395,7 +396,7 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   if (isLocalOnly(doc, key, hostname)) return false;
   const subdir = getSubdir(key);
   if (!subdir) return false;
-  if (!shouldSync(key, config)) return false;
+  if (!shouldSync(key, state.config)) return false;
 
   const absPath = piPathForKey(key);
   if (!absPath) return false;
@@ -522,7 +523,7 @@ async function flushPendingChanges() {
   const deletions: string[] = [];
   for (const rawKey of files) {
     const key = normalizeFileKey(rawKey);
-    if (!key || !shouldSync(key, config)) continue;
+    if (!key || !shouldSync(key, state.config)) continue;
     const absPath = piPathForKey(key);
     if (!absPath) continue;
     if (fs.existsSync(absPath)) {
@@ -594,7 +595,7 @@ function startFileWatcher() {
 
       const absPath = path.join(PI_DIR, filename);
       const key = normalizeFileKey(fileKey(absPath));
-      if (!key || !shouldSync(key, config)) return;
+      if (!key || !shouldSync(key, state.config)) return;
       const subdir = getSubdir(key);
       if (!subdir) return;
 
@@ -749,12 +750,12 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   // ── WebSocket server ──────────────────────────────────────────────
 
-  state.wss = new WebSocketServer({ port: config.port });
+  state.wss = new WebSocketServer({ port: state.config.port });
 
   state.wss.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
       console.error(
-        `[pi-sync] Port ${config.port} is in use. ` +
+        `[pi-sync] Port ${state.config.port} is in use. ` +
         `Edit ~/.config/pi-sync/config.json to change.`
       );
     } else {
@@ -775,7 +776,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   const serverAdapter = new NodeWSServerAdapter(state.wss);
   const adapters: any[] = [serverAdapter];
 
-  for (const peer of config.peers) {
+  for (const peer of state.config.peers) {
     if (peerHost(peer) === hostname) continue;
     adapters.push(new WebSocketClientAdapter(`ws://${peer}`));
   }
@@ -922,7 +923,7 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   state.standbyMode = true;
   const { default: WebSocket } = await import("ws");
   await new Promise<void>((resolve) => {
-    const ws = new WebSocket(`ws://localhost:${config.port}`);
+    const ws = new WebSocket(`ws://localhost:${state.config.port}`);
     ws.on("close", () => resolve());
     ws.on("error", () => resolve());
   });
@@ -933,9 +934,9 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   await new Promise((r) => setTimeout(r, jitterMs));
 
   // Did another standby already claim the port while we waited?
-  if (await probePeer("localhost", config.port, 500)) {
+  if (await probePeer("localhost", state.config.port, 500)) {
     console.log(
-      `[pi-sync] Another instance took port ${config.port} — resuming standby`,
+      `[pi-sync] Another instance took port ${state.config.port} — resuming standby`,
     );
     watchAndTakeOver(pi).catch((e: any) =>
       console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
@@ -961,7 +962,7 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
 // ── Extension entry point ─────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-  config = loadConfig();
+  state.config = loadConfig();
 
   // Write default config if missing
   ensureDir(CONFIG_DIR);
@@ -977,7 +978,7 @@ export default async function (pi: ExtensionAPI) {
   /** Write updated config to disk */
   function saveConfig() {
     ensureDir(CONFIG_DIR);
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(state.config, null, 2) + "\n");
   }
 
   pi.registerCommand("sync:status", {
@@ -987,12 +988,12 @@ export default async function (pi: ExtensionAPI) {
       const docUrl = loadDocUrl();
       const onOff = (b: boolean) => b ? "✅" : "❌";
       const lines = [
-        `**pi-sync**  ─  \`${hostname}\`  :${config.port}`,
+        `**pi-sync**  ─  \`${hostname}\`  :${state.config.port}`,
         ``,
         `Document: \`${docUrl ? docUrl.slice(0, 28) + "…" : "not set"}\``,
-        `Peers (${config.peers.length}):`,
-        ...(config.peers.length > 0
-          ? config.peers.map((p) => {
+        `Peers (${state.config.peers.length}):`,
+        ...(state.config.peers.length > 0
+          ? state.config.peers.map((p) => {
               const h = peerHost(p);
               const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
               return `  ${mark} \`${p}\``;
@@ -1000,7 +1001,7 @@ export default async function (pi: ExtensionAPI) {
           : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
         ),
         ``,
-        `Syncing: ${onOff(config.syncSettings)} settings  ${onOff(config.syncModels)} models  ${onOff(config.syncExtensions)} extensions  ${onOff(config.syncSkills)} skills  ${onOff(config.syncPrompts)} prompts`,
+        `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts`,
         ``,
         `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts`,
         `Local-only: \`${Object.keys(doc?.localOnly ?? {}).length}\` entries`,
@@ -1032,18 +1033,18 @@ export default async function (pi: ExtensionAPI) {
       const target = parts.slice(1).join(" ");
 
       if (action === "list" || action === "ls") {
-        if (config.peers.length === 0) {
+        if (state.config.peers.length === 0) {
           ctx.ui.notify(
             "No peers configured.\n\nAdd one: \`/sync:peers add laptop.tailnet.ts.net:3030\`\nAuto-discover: \`/sync:peers scan\`",
             "info",
           );
         } else {
-          const list = config.peers.map((p) => {
+          const list = state.config.peers.map((p) => {
             const h = peerHost(p);
             const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
             return `  ${mark} \`${p}\``;
           }).join("\n");
-          ctx.ui.notify(`**Peers (${config.peers.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
+          ctx.ui.notify(`**Peers (${state.config.peers.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
         }
         return;
       }
@@ -1053,7 +1054,7 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify("Format: \`host:port\` (e.g. \`laptop.tailnet.ts.net:3030\`)", "error");
           return;
         }
-        if (config.peers.includes(target)) {
+        if (state.config.peers.includes(target)) {
           ctx.ui.notify(`\`${target}\` is already in the peer list.`, "info");
           return;
         }
@@ -1061,7 +1062,7 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify("That's your own hostname — not adding self.", "info");
           return;
         }
-        config.peers.push(target);
+        state.config.peers.push(target);
         saveConfig();
         ctx.ui.notify(
           `Added peer \`${target}\`. Restart pi or run \`/reload\` to connect.`,
@@ -1079,11 +1080,11 @@ export default async function (pi: ExtensionAPI) {
         // a string-prefix match (which would remove "host2:3030" when the
         // user asked to remove "host").
         const targetHost = peerHost(target);
-        const before = config.peers.length;
-        config.peers = config.peers.filter(
+        const before = state.config.peers.length;
+        state.config.peers = state.config.peers.filter(
           (p) => p !== target && peerHost(p) !== targetHost,
         );
-        if (config.peers.length === before) {
+        if (state.config.peers.length === before) {
           ctx.ui.notify(`Peer \`${target}\` not found.`, "info");
         } else {
           state.wsConnectedPeers.delete(targetHost);
@@ -1126,7 +1127,7 @@ export default async function (pi: ExtensionAPI) {
             await Promise.all(
               tailscalePeers.map(async (p) => ({
                 ...p,
-                reachable: await probePeer(p.fqdn, config.port),
+                reachable: await probePeer(p.fqdn, state.config.port),
               })),
             );
 
@@ -1135,7 +1136,7 @@ export default async function (pi: ExtensionAPI) {
 
           if (syncPeers.length === 0) {
             ctx.ui.notify(
-              `Found ${probed.length} Tailscale peer(s), but none are running pi-sync on port ${config.port}.\n\n` +
+              `Found ${probed.length} Tailscale peer(s), but none are running pi-sync on port ${state.config.port}.\n\n` +
               `Offline peers: ${nonSyncPeers.map((p) => `\`${p.host}\``).join(", ") || "none"}`,
               "info",
             );
@@ -1143,13 +1144,13 @@ export default async function (pi: ExtensionAPI) {
           }
 
           const isConfigured = (host: string) =>
-            config.peers.some((ep) => peerHost(ep) === host);
+            state.config.peers.some((ep) => peerHost(ep) === host);
           const newSyncPeers = syncPeers.filter((p) => !isConfigured(p.host));
           const alreadyConfigured = syncPeers.filter((p) => isConfigured(p.host));
 
           if (alreadyConfigured.length > 0) {
             ctx.ui.notify(
-              `Already configured:\n${alreadyConfigured.map((p) => `  ✅ \`${p.fqdn}:${config.port}\``).join("\n")}`,
+              `Already configured:\n${alreadyConfigured.map((p) => `  ✅ \`${p.fqdn}:${state.config.port}\``).join("\n")}`,
               "info",
             );
           }
@@ -1161,7 +1162,7 @@ export default async function (pi: ExtensionAPI) {
             return;
           }
 
-          const peerOptions = newSyncPeers.map((p) => `${p.fqdn}:${config.port}`);
+          const peerOptions = newSyncPeers.map((p) => `${p.fqdn}:${state.config.port}`);
           const selection = await ctx.ui.select(
             `Found ${newSyncPeers.length} pi-sync peer(s). Select one to add:`,
             newSyncPeers.length > 1 ? ["Add all", ...peerOptions] : peerOptions,
@@ -1170,7 +1171,7 @@ export default async function (pi: ExtensionAPI) {
           if (selection) {
             const selectedPeers = selection === "Add all" ? peerOptions : [selection];
             for (const p of selectedPeers) {
-              if (!config.peers.includes(p)) config.peers.push(p);
+              if (!state.config.peers.includes(p)) state.config.peers.push(p);
             }
             saveConfig();
             ctx.ui.notify(
@@ -1198,11 +1199,11 @@ export default async function (pi: ExtensionAPI) {
     description: "Toggle what gets synced (interactive settings panel)",
     handler: async (_args, ctx) => {
       const buildItems = (): SettingItem[] => [
-        { id: "syncSettings", label: "Settings", currentValue: config.syncSettings ? "on" : "off", values: ["on", "off"] },
-        { id: "syncModels", label: "Models", currentValue: config.syncModels ? "on" : "off", values: ["on", "off"] },
-        { id: "syncExtensions", label: "Extensions", currentValue: config.syncExtensions ? "on" : "off", values: ["on", "off"] },
-        { id: "syncSkills", label: "Skills", currentValue: config.syncSkills ? "on" : "off", values: ["on", "off"] },
-        { id: "syncPrompts", label: "Prompts", currentValue: config.syncPrompts ? "on" : "off", values: ["on", "off"] },
+        { id: "syncSettings", label: "Settings", currentValue: state.config.syncSettings ? "on" : "off", values: ["on", "off"] },
+        { id: "syncModels", label: "Models", currentValue: state.config.syncModels ? "on" : "off", values: ["on", "off"] },
+        { id: "syncExtensions", label: "Extensions", currentValue: state.config.syncExtensions ? "on" : "off", values: ["on", "off"] },
+        { id: "syncSkills", label: "Skills", currentValue: state.config.syncSkills ? "on" : "off", values: ["on", "off"] },
+        { id: "syncPrompts", label: "Prompts", currentValue: state.config.syncPrompts ? "on" : "off", values: ["on", "off"] },
       ];
 
       await ctx.ui.custom((tui, theme, _kb, done) => {
@@ -1219,7 +1220,7 @@ export default async function (pi: ExtensionAPI) {
             // Only the boolean sync* toggles are exposed in buildItems();
             // port/peers aren't reachable from this panel.
             const key = id as "syncSettings" | "syncExtensions" | "syncSkills" | "syncModels" | "syncPrompts";
-            config[key] = (newValue === "on");
+            state.config[key] = (newValue === "on");
             saveConfig();
             // Update the list item in-place
             settingsList.updateValue(id, newValue);
@@ -1258,7 +1259,7 @@ export default async function (pi: ExtensionAPI) {
       ``,
       `**On the other machine:**`,
       `1. Install pi-sync (same setup as this machine)`,
-      `2. \`/sync:peers add ${hostname}:${config.port}\``,
+      `2. \`/sync:peers add ${hostname}:${state.config.port}\``,
       `3. \`/sync:import ${docUrl}\``,
       `4. \`/reload\``,
       ``,
@@ -1308,7 +1309,7 @@ export default async function (pi: ExtensionAPI) {
         fs.rmSync(AM_STORAGE, { recursive: true, force: true });
       } catch {}
       // Re-initialize with a fresh state
-      config = loadConfig();
+      state.config = loadConfig();
       try {
         await initRepo(pi);
         // After fresh init, restart runtime loops stopped during unlink.
@@ -1492,8 +1493,8 @@ export default async function (pi: ExtensionAPI) {
 
   function getSyncLabel(): string {
     if (state.standbyMode) return "⛓️  standby";
-    const total = config.peers.length;
-    const wsOnline = config.peers.filter((p) => state.wsConnectedPeers.has(peerHost(p))).length;
+    const total = state.config.peers.length;
+    const wsOnline = state.config.peers.filter((p) => state.wsConnectedPeers.has(peerHost(p))).length;
     const showRefresh = Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
 
     let label: string;
@@ -1647,7 +1648,7 @@ export default async function (pi: ExtensionAPI) {
   // and bails out via the guard above.
   state.initInProgress = true;
   try {
-    if (await probePeer("localhost", config.port, 500)) {
+    if (await probePeer("localhost", state.config.port, 500)) {
       // Background watchdog — pi continues immediately, widget shows status.
       // When the other instance exits it terminates all clients, causing
       // watchAndTakeOver's WebSocket to close and auto-take-over.
