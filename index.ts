@@ -1587,6 +1587,14 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // ── Start syncing (or wait for takeover) ──────────────────────────
+  //
+  // Re-entry guards: when extensions are reloaded within the same
+  // process (e.g. /new creates a fresh ResourceLoader), module-level
+  // state persists. Two guards:
+  //   1. standbyMode — a watchAndTakeOver is already in flight, don't
+  //      interfere (it will handle takeover and set standbyMode=false).
+  //   2. handle — repo already initialized, just restart watchers.
+  if (standbyMode || handle) return;
 
   if (await probePeer("localhost", config.port, 500)) {
     // Background watchdog — pi continues immediately, widget shows status.
