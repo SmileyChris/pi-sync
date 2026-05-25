@@ -25,11 +25,11 @@
  *   /sync:local-only   – manage local-only files
  */
 
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { PeerId } from "@automerge/automerge-repo";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { installFooter } from "./footer";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -844,7 +844,8 @@ async function shutdownRepo() {
   stopFileWatcher();
   stopProbing();
   stopPurgeTimer();
-  if (state.renderTimer) { clearInterval(state.renderTimer); state.renderTimer = null; }
+  // renderTimer is owned by the footer (started/stopped via setFooter
+  // dispose); shutdownRepo intentionally doesn't touch it.
   state.wsConnectedPeers.clear();
   state.tcpReachablePeers.clear();
   state.initialSyncReady = false;
@@ -1276,7 +1277,6 @@ export default async function (pi: ExtensionAPI) {
         startFileWatcher();
         startPurgeTimer();
         startProbing();
-        startRenderTimer();
         ctx.ui.notify(
           "Unlinked from sync network. A fresh document has been created.\n\n" +
           "To re-join later, use \`/sync:import <url>\` from a paired machine.",
@@ -1449,35 +1449,6 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Sync label helper ────────────────────────────────────────────
-
-  function getSyncLabel(): string {
-    if (state.standbyMode) return "⛓️  standby";
-    const total = state.config.peers.length;
-    const wsOnline = state.config.peers.filter((p) => state.wsConnectedPeers.has(peerHost(p))).length;
-    const showRefresh = Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
-
-    let label: string;
-    if (total === 0) label = "🔗";
-    else if (wsOnline > 0) label = `🔗 ${wsOnline}`;
-    else label = `🔗 ${total}`;
-
-    if (showRefresh && state.recentRemoteChanges.length > 0) label += ` 🔄`;
-    return label;
-  }
-
-  // ── Custom footer timer (triggers re-render every 5s) ────────────
-
-  function startRenderTimer() {
-    if (state.renderTimer) return;
-    state.renderTimer = setInterval(() => {
-      state.tuiRef?.requestRender();
-    }, 5000);
-  }
-  function stopRenderTimer() {
-    if (state.renderTimer) { clearInterval(state.renderTimer); state.renderTimer = null; }
-  }
-
   // ── Lifecycle ─────────────────────────────────────────────────────
   // Register these before init so they're always active (even when
   // waiting for takeover).
@@ -1485,69 +1456,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     state.activeUi = ctx.ui;
     state.currentCtx = ctx;
-
-    // ── Custom footer: cwd+branch left, pi-sync label right on line 1 ──
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      state.tuiRef = tui;
-      const unsub = footerData.onBranchChange(() => tui.requestRender());
-      startRenderTimer();
-
-      return {
-        dispose() { unsub(); stopRenderTimer(); state.tuiRef = null; },
-        invalidate() {},
-        render(width: number): string[] {
-          const liveCtx = state.currentCtx;
-          if (!liveCtx) return ["", ""];
-
-          // ── Line 1: cwd + branch left, sync label right ──
-          let pwd = process.cwd();
-          const home = process.env.HOME || process.env.USERPROFILE;
-          if (home && pwd.startsWith(home)) pwd = `~${pwd.slice(home.length)}`;
-          const branch = footerData.getGitBranch();
-          if (branch) pwd = `${pwd} (${branch})`;
-          const sessionName = liveCtx.sessionManager.getSessionName();
-          if (sessionName) pwd = `${pwd} • ${sessionName}`;
-
-          const left1 = theme.fg("dim", pwd);
-          const right1 = getSyncLabel();
-          const pad1 = " ".repeat(Math.max(1, width - visibleWidth(left1) - visibleWidth(right1)));
-          const line1 = truncateToWidth(left1 + pad1 + right1, width);
-
-          // ── Line 2: token stats left, model info right ──
-          let totalInput = 0, totalOutput = 0, totalCache = 0;
-          let cost = 0;
-          for (const entry of liveCtx.sessionManager.getBranch()) {
-            if (entry.type === "message" && entry.message.role === "assistant") {
-              const m = entry.message as AssistantMessage;
-              totalInput += m.usage.input;
-              totalOutput += m.usage.output;
-              totalCache += (m.usage as any).cacheRead ?? 0;
-              totalCache += (m.usage as any).cacheCreation ?? 0;
-              cost += m.usage.cost.total;
-            }
-          }
-          const fmt = (n: number) => n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`;
-          let statsLeft = `↑${fmt(totalInput)} ↓${fmt(totalOutput)}`;
-          if (totalCache > 0) statsLeft += ` R${fmt(totalCache)}`;
-          statsLeft += ` $${cost.toFixed(3)}`;
-          const contextUsage = liveCtx.getContextUsage?.();
-          if (contextUsage?.percent != null) {
-            const pct = contextUsage.percent.toFixed(1);
-            const cw = contextUsage.contextWindow ? `/${fmt(contextUsage.contextWindow)}` : "";
-            statsLeft += ` ${pct}%${cw}`;
-          }
-
-          const model = liveCtx.model;
-          const right2 = model ? `${model.id} • ${model.mode || "auto"}` : "";
-          const dimLeft = theme.fg("dim", statsLeft);
-          const dimRight = theme.fg("dim", right2);
-          const pad2 = " ".repeat(Math.max(1, width - visibleWidth(dimLeft) - visibleWidth(dimRight)));
-          const line2 = truncateToWidth(dimLeft + pad2 + dimRight, width);
-
-          return [line1, line2];
-        },
-      };
-    });
+    installFooter(ctx.ui);
 
     // No importAllFiles here: initRepo already pushed local files during
     // startup, and the fs.watch loop catches any changes made while pi
