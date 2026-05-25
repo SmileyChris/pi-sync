@@ -1617,15 +1617,11 @@ export default async function (pi: ExtensionAPI) {
       };
     });
 
+    // No importAllFiles here: initRepo already pushed local files during
+    // startup, and the fs.watch loop catches any changes made while pi
+    // is running. Re-importing on every /new churned through hundreds of
+    // files just to short-circuit on syncedFileContentMatches.
     if (!state.handle) return;
-    const doc = await state.handle.doc?.();
-    if (!doc) return;
-
-    withSuppressedExport(() => {
-      state.handle.change?.((d: PiConfigDocument) => {
-        importAllFiles(d);
-      });
-    });
 
     // Start health probing
     startProbing();
