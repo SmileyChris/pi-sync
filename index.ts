@@ -798,7 +798,7 @@ async function shutdownRepo() {
   stopFileWatcher();
   stopProbing();
   stopPurgeTimer();
-  stopRenderTimer();
+  if (renderTimer) { clearInterval(renderTimer); renderTimer = null; }
   wsConnectedPeers.clear();
   tcpReachablePeers.clear();
   initialSyncReady = false;
@@ -806,7 +806,17 @@ async function shutdownRepo() {
     try { await repo.shutdown?.(); } catch {}
   }
   if (wss) {
-    try { wss.close?.(); } catch {}
+    try {
+      // wss.close() only stops accepting new connections — existing
+      // clients stay connected. Terminate them so the standby WebSocket
+      // in watchAndTakeOver detects the close and can take over.
+      for (const client of wss.clients) {
+        try { client.terminate(); } catch {}
+      }
+      await new Promise<void>((resolve, reject) => {
+        wss.close((err?: Error) => (err ? reject(err) : resolve()));
+      });
+    } catch {}
     wss = null;
   }
   repo = null;
@@ -1503,7 +1513,9 @@ export default async function (pi: ExtensionAPI) {
   // ── Start syncing (or wait for takeover) ──────────────────────────
 
   if (await probePeer("localhost", config.port, 500)) {
-    // Background watchdog — pi continues immediately, widget shows status
+    // Background watchdog — pi continues immediately, widget shows status.
+    // When the other instance exits it terminates all clients, causing
+    // watchAndTakeOver's WebSocket to close and auto-take-over.
     watchAndTakeOver(pi).catch((e: any) =>
       console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
     );
