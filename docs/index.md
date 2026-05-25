@@ -14,6 +14,14 @@ P2P sync for pi coding agent settings using [Automerge](https://automerge.org/) 
 
 The `pi-sync` extension itself is **never** synced — it is skipped by file collection and `shouldSync` gating, and its entries in the Automerge document are pinned to `localOnly` on creation because its WASM binaries and peer config are machine-specific.
 
+## What is NOT synced
+
+pi-sync only watches files under `~/.pi/agent/`. Anything outside that tree is out of scope:
+
+- **Pi-managed data outside `~/.pi/agent/`** — databases, caches, and runtime state that live elsewhere (e.g. under `~/.pi/`) are not synced. Each machine builds its own from local sessions.
+- **Extension runtime data** — any files or databases an extension creates at runtime (indexes, logs, local-only config). Extensions are synced as source code; their runtime output is not.
+- **Machine-specific config** — peer lists, port numbers, Automerge doc URLs. These live in `~/.config/pi-sync/` and are never shared.
+
 ## Next steps
 
 - New here? Start with [Install](get-started/install.md), then [Pair machines](get-started/pair-machines.md).
