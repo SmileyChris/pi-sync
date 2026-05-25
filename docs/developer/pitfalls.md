@@ -6,6 +6,8 @@
 - **Missing tailscale.** `/sync:peers scan` requires the `tailscale` CLI. Handle the error gracefully and tell the user.
 - **Empty document on first export.** A fresh document has zero extensions/skills/settings. The export path skips writing when the document appears empty (no content to export yet).
 - **Self-peer.** Don't add the current hostname as a peer. The `peers add` command rejects it.
+- **Peer list edits are deferred to `/reload`.** The Automerge repo's WebSocket adapter list is frozen at `initRepo` time. `/sync:peers add|remove` updates `state.config.peers` and the disk file but the live adapters don't change until reload. `/sync:status` marks pending entries with `_(pending /reload)_`.
+- **Dependency install is now async.** `installMissingExtensionDeps` switched from `execSync` to `exec` (promisified) and runs as fire-and-forget from the export path. A `state.installRunning` guard prevents a concurrent module load from kicking off a second installer for the same dir.
 
 ## Dependencies
 

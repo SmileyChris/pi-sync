@@ -10,7 +10,9 @@ These are the project's rules of the road for contributors. The order is not str
 
 4. **Mass-delete brake.** If more than `MASS_DELETE_LIMIT` (5) files vanish in a single watcher flush, the deletion pass is aborted and no tombstones are created for those missing files. Present add/update imports in the same flush may still be applied. The user must restore files on disk, or restore and remove a small, deliberate batch if they intend to propagate deletes.
 
-5. **Export guard (`exporting` flag + `suppressExportDepth` counter).** When exporting or making disk-originated changes, suppress the change listener to avoid feedback loops. Use `withSuppressedExport()` for nested operations.
+5. **Export guard (`state.exporting` flag + `state.suppressExportDepth` counter).** When exporting or making disk-originated changes, suppress the change listener to avoid feedback loops. Use `withSuppressedExport()` for nested operations.
+
+5a. **All mutable runtime state lives on the `state` singleton in `state.ts`.** pi reloads extensions through jiti with `moduleCache: false`, which fully re-executes the module body on every `/new` and `/reload`. Module-level `let` bindings would reset to their defaults every time, racing against the previous instance's still-running timers, watchers, and crash-guard handlers. The shared `state` (keyed by `Symbol.for("pi-sync:state")`) gives every re-instantiation a single source of truth. The entry-point re-entry guard checks `state.standbyMode || state.handle || state.initInProgress` to decide whether the previous instance still owns the WS port.
 
 6. **ImmutableString unwrapping.** Automerge may return content fields wrapped as `ImmutableString { val: "..." }` instead of a plain string. Always use `unwrapContent()` from `lib.ts`.
 

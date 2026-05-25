@@ -22,6 +22,8 @@ npx vitest          # watch mode
 | `parsePeer`, `peerHost` | Peer string parsing, host extraction |
 | `dirtyKeysFromPatches` | Patch → fileKey mapping, unsafe-key rejection |
 | `collectExtensionFiles/SkillFiles/PromptFiles` | Directory walking, skip rules |
+| `isDocEmpty` | First-sync protection (don't wipe local files if the doc is empty) |
+| `partitionPendingChanges` | Watcher present/deletion routing, mass-delete brake, tombstone idempotence |
 
 When adding new logic, prefer to put it in `lib.ts` and add tests there.
 
