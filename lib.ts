@@ -421,6 +421,63 @@ export function dirtyKeysFromPatches(patches: ReadonlyArray<PatchLike>): Set<str
   return dirty;
 }
 
+export type PartitionedChanges = {
+  /** Keys that exist on disk → import/update in the doc. */
+  present: string[];
+  /** Keys that vanished from disk but still have a live (non-tombstoned)
+   *  entry in the doc → candidates to tombstone. */
+  deletions: string[];
+  /** True if the candidate-delete count exceeds MASS_DELETE_LIMIT; the
+   *  caller should refuse to write the tombstones. */
+  blockedDeletions: boolean;
+};
+
+/** Partition a batch of pending file-watcher events into present/delete
+ *  buckets plus a mass-delete brake. Pure: the caller supplies an
+ *  existence probe so this is testable without touching fs. */
+export function partitionPendingChanges(
+  rawKeys: Iterable<string>,
+  config: SyncConfig,
+  doc: PiConfigDocument,
+  exists: (key: string) => boolean,
+): PartitionedChanges {
+  const present: string[] = [];
+  const deletions: string[] = [];
+  for (const rawKey of rawKeys) {
+    const key = normalizeFileKey(rawKey);
+    if (!key || !shouldSync(key, config)) continue;
+    if (exists(key)) {
+      present.push(key);
+      continue;
+    }
+    const subdir = getSubdir(key);
+    // Settings/models are whole-file JSON; their absence on disk is not a
+    // delete signal (avoids propagating transient removals).
+    if (subdir !== "extensions" && subdir !== "skills" && subdir !== "prompts") continue;
+    const collection = doc[subdir] as Record<string, SyncedFile>;
+    const entry = collection?.[key];
+    if (entry && !isTombstone(entry)) deletions.push(key);
+  }
+  return {
+    present,
+    deletions,
+    blockedDeletions: deletions.length > MASS_DELETE_LIMIT,
+  };
+}
+
+/** True iff the doc has no synced content in any collection. Writing the
+ *  empty shape to disk on first run would wipe local files, so callers
+ *  short-circuit exports when this is true. */
+export function isDocEmpty(doc: PiConfigDocument): boolean {
+  return (
+    Object.keys(doc.extensions).length === 0 &&
+    Object.keys(doc.skills).length === 0 &&
+    Object.keys(doc.prompts).length === 0 &&
+    Object.keys(doc.settings).length === 0 &&
+    Object.keys(doc.models).length === 0
+  );
+}
+
 // ── Peer helpers ─────────────────────────────────────────────────────
 
 export function parsePeer(peer: string): { host: string; port: number } | null {

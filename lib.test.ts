@@ -30,10 +30,12 @@ import {
   collectSkillFiles,
   collectPromptFiles,
   dirtyKeysFromPatches,
+  isDocEmpty,
   isTombstone,
   isPastTTL,
-  TOMBSTONE_TTL_MS,
+  partitionPendingChanges,
   MASS_DELETE_LIMIT,
+  TOMBSTONE_TTL_MS,
   PI_DIR,
   type fsDirEntry,
 } from "./lib";
@@ -777,5 +779,178 @@ describe("collectPromptFiles", () => {
       "custom": { "prompt.md": null },
     });
     expect(collectPromptFiles(root, fs).length).toBe(1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+//  isDocEmpty
+// ────────────────────────────────────────────────────────────────────
+
+function emptyDoc(): PiConfigDocument {
+  return {
+    settings: {},
+    models: {},
+    extensions: {},
+    skills: {},
+    prompts: {},
+    localOnly: {},
+    lastSync: {},
+  };
+}
+
+describe("isDocEmpty", () => {
+  it("returns true on a freshly-shaped doc", () => {
+    expect(isDocEmpty(emptyDoc())).toBe(true);
+  });
+
+  it("ignores localOnly and lastSync (those aren't sync content)", () => {
+    const doc = emptyDoc();
+    doc.localOnly["extensions/foo"] = ["hostA"];
+    doc.lastSync["hostA"] = 123;
+    expect(isDocEmpty(doc)).toBe(true);
+  });
+
+  it("returns false when any collection has an entry", () => {
+    for (const k of ["extensions", "skills", "prompts"] as const) {
+      const doc = emptyDoc();
+      (doc[k] as Record<string, unknown>)["x"] = { content: "y", installedAt: 1 };
+      expect(isDocEmpty(doc)).toBe(false);
+    }
+  });
+
+  it("returns false when settings or models have keys", () => {
+    const a = emptyDoc(); a.settings = { theme: "dark" } as any;
+    const b = emptyDoc(); b.models = { "claude-opus": {} } as any;
+    expect(isDocEmpty(a)).toBe(false);
+    expect(isDocEmpty(b)).toBe(false);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+//  partitionPendingChanges
+// ────────────────────────────────────────────────────────────────────
+
+describe("partitionPendingChanges", () => {
+  const cfg: SyncConfig = { ...DEFAULT_SYNC_CONFIG };
+
+  function withEntry(doc: PiConfigDocument, key: string, entry: any) {
+    const subdir = key.split("/")[0] as "extensions" | "skills" | "prompts";
+    (doc[subdir] as Record<string, unknown>)[key] = entry;
+    return doc;
+  }
+
+  it("routes existing files into `present`", () => {
+    const out = partitionPendingChanges(
+      ["extensions/foo/index.ts"],
+      cfg,
+      emptyDoc(),
+      () => true,
+    );
+    expect(out.present).toEqual(["extensions/foo/index.ts"]);
+    expect(out.deletions).toEqual([]);
+    expect(out.blockedDeletions).toBe(false);
+  });
+
+  it("routes missing files with a live doc entry into `deletions`", () => {
+    const doc = withEntry(emptyDoc(), "extensions/foo/index.ts", {
+      content: "x", installedAt: 1,
+    });
+    const out = partitionPendingChanges(
+      ["extensions/foo/index.ts"],
+      cfg,
+      doc,
+      () => false,
+    );
+    expect(out.deletions).toEqual(["extensions/foo/index.ts"]);
+    expect(out.present).toEqual([]);
+  });
+
+  it("ignores missing files with no doc entry (re-delete is a no-op)", () => {
+    const out = partitionPendingChanges(
+      ["extensions/foo/index.ts"],
+      cfg,
+      emptyDoc(),
+      () => false,
+    );
+    expect(out.deletions).toEqual([]);
+    expect(out.present).toEqual([]);
+  });
+
+  it("ignores missing files whose doc entry is already tombstoned", () => {
+    const doc = withEntry(emptyDoc(), "extensions/foo/index.ts", {
+      content: "x", installedAt: 1,
+      deletedAt: Date.now() - 1000, deletedBy: "hostA",
+    });
+    const out = partitionPendingChanges(
+      ["extensions/foo/index.ts"],
+      cfg,
+      doc,
+      () => false,
+    );
+    expect(out.deletions).toEqual([]);
+  });
+
+  it("never tombstones settings.json or models.json — whole-file JSON treats absence as no-op", () => {
+    const out = partitionPendingChanges(
+      ["settings.json", "models.json"],
+      cfg,
+      emptyDoc(),
+      () => false,
+    );
+    expect(out.deletions).toEqual([]);
+    expect(out.present).toEqual([]);
+  });
+
+  it("respects the sync-category toggles", () => {
+    const noSkills: SyncConfig = { ...cfg, syncSkills: false };
+    const out = partitionPendingChanges(
+      ["skills/foo/SKILL.md", "extensions/bar/index.ts"],
+      noSkills,
+      emptyDoc(),
+      () => true,
+    );
+    expect(out.present).toEqual(["extensions/bar/index.ts"]);
+  });
+
+  it("trips blockedDeletions past MASS_DELETE_LIMIT", () => {
+    const doc = emptyDoc();
+    const keys: string[] = [];
+    for (let i = 0; i < MASS_DELETE_LIMIT + 1; i++) {
+      const k = `extensions/ext${i}/index.ts`;
+      keys.push(k);
+      withEntry(doc, k, { content: "x", installedAt: 1 });
+    }
+    const out = partitionPendingChanges(keys, cfg, doc, () => false);
+    expect(out.deletions.length).toBe(MASS_DELETE_LIMIT + 1);
+    expect(out.blockedDeletions).toBe(true);
+  });
+
+  it("does not trip the brake exactly at the limit", () => {
+    const doc = emptyDoc();
+    const keys: string[] = [];
+    for (let i = 0; i < MASS_DELETE_LIMIT; i++) {
+      const k = `extensions/ext${i}/index.ts`;
+      keys.push(k);
+      withEntry(doc, k, { content: "x", installedAt: 1 });
+    }
+    const out = partitionPendingChanges(keys, cfg, doc, () => false);
+    expect(out.deletions.length).toBe(MASS_DELETE_LIMIT);
+    expect(out.blockedDeletions).toBe(false);
+  });
+
+  it("skips unsupported keys (path traversal, unsupported extensions, skip-dirs)", () => {
+    const out = partitionPendingChanges(
+      [
+        "extensions/../../etc/passwd",     // path traversal
+        "extensions/foo/runtime.db",        // unsupported suffix
+        "extensions/foo/node_modules/x.js", // skip-dir
+        "extensions/pi-sync/index.ts",      // pi-sync itself never syncs
+      ],
+      cfg,
+      emptyDoc(),
+      () => true,
+    );
+    expect(out.present).toEqual([]);
+    expect(out.deletions).toEqual([]);
   });
 });

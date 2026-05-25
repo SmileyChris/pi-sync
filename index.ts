@@ -60,8 +60,10 @@ import {
   collectSkillFiles,
   collectPromptFiles,
   dirtyKeysFromPatches,
+  isDocEmpty,
   isTombstone,
   isPastTTL,
+  partitionPendingChanges,
 } from "./lib";
 
 export type { SyncedFile, PiConfigDocument, SyncConfig };
@@ -351,18 +353,6 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   return true;
 }
 
-/** Treat the doc as uninitialized if it has no synced content yet.
- *  Writing the empty shape to disk on first run would wipe local files. */
-function isDocEmpty(doc: PiConfigDocument): boolean {
-  return (
-    Object.keys(doc.extensions).length === 0 &&
-    Object.keys(doc.skills).length === 0 &&
-    Object.keys(doc.prompts).length === 0 &&
-    Object.keys(doc.settings).length === 0 &&
-    Object.keys(doc.models).length === 0
-  );
-}
-
 /** After exporting a batch of files, check any extension dirs that had
  *  files written. If the extension has a package.json with dependencies
  *  but no node_modules, run `npm install --ignore-scripts` so pi doesn't
@@ -455,42 +445,25 @@ async function flushPendingChanges() {
   const currentDoc = await state.handle.doc?.();
   if (!currentDoc) return;
 
-  // Partition into present (add/update) vs missing (potential delete).
-  // A "missing" key only counts as a delete if the doc still has a LIVE
-  // entry — re-deletion of an already-tombstoned entry is a no-op.
-  const present: string[] = [];
-  const deletions: string[] = [];
-  for (const rawKey of files) {
-    const key = normalizeFileKey(rawKey);
-    if (!key || !shouldSync(key, state.config)) continue;
-    const absPath = piPathForKey(key);
-    if (!absPath) continue;
-    if (fs.existsSync(absPath)) {
-      present.push(key);
-      continue;
-    }
-    const subdir = getSubdir(key);
-    // Only collection sections are tombstoneable. Settings/models are
-    // whole-file JSON; their absence is treated as "no changes" so peers
-    // don't propagate transient deletions of those files.
-    if (subdir !== "extensions" && subdir !== "skills" && subdir !== "prompts") continue;
-    const collection = currentDoc[subdir] as Record<string, SyncedFile>;
-    const entry = collection?.[key];
-    if (entry && !isTombstone(entry)) deletions.push(key);
-  }
+  const { present, deletions, blockedDeletions } = partitionPendingChanges(
+    files,
+    state.config,
+    currentDoc,
+    (key) => {
+      const absPath = piPathForKey(key);
+      return absPath != null && fs.existsSync(absPath);
+    },
+  );
 
-  // Mass-delete brake: refuse to propagate large bursts. The user likely
-  // ran `rm -rf` / `git clean` / similar — better to require them to
-  // resurrect on disk and make a smaller deliberate delete than silently
-  // wipe the cluster.
-  let blockedDeletions = false;
-  if (deletions.length > MASS_DELETE_LIMIT) {
+  if (blockedDeletions) {
+    // The user likely ran `rm -rf` / `git clean` / similar — better to
+    // require them to restore the files and make a smaller deliberate
+    // delete than silently wipe the cluster.
     console.error(
       `[pi-sync] Mass-delete brake: ${deletions.length} files vanished in one flush ` +
       `(limit ${MASS_DELETE_LIMIT}). No tombstones were created for those missing files. ` +
       `Restore them on disk, or restore and remove a smaller deliberate batch to propagate deletes.`,
     );
-    blockedDeletions = true;
   }
 
   withSuppressedExport(() => {
