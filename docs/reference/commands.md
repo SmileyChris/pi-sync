@@ -10,10 +10,6 @@ Show sync state, peers, and document info.
 
 Show your document URL (share to pair another machine).
 
-## `/sync:invite`
-
-Alias for `/sync:info`.
-
 ## `/sync:import <url>`
 
 Join an existing sync network using a doc URL printed by `/sync:info` on another machine.

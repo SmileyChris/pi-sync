@@ -8,13 +8,13 @@ These are the project's rules of the road for contributors. The order is not str
 
 3. **Tombstone model for deletions.** When a file is deleted on disk (detected by the watcher), the doc entry is *not* removed. Instead, `deletedAt` and `deletedBy` are set. The export path moves the local file to `TRASH_DIR` and the entry stays in the doc until TTL purge (14 days) or explicit `sync:trash empty`. This prevents accidental cluster-wide wipe.
 
-4. **Mass-delete brake.** If more than `MASS_DELETE_LIMIT` (5) files vanish in a single watcher flush, the entire batch is aborted. The user must restore files on disk or use `sync:trash empty <path>` per file to confirm.
+4. **Mass-delete brake.** If more than `MASS_DELETE_LIMIT` (5) files vanish in a single watcher flush, the deletion pass is aborted and no tombstones are created for those missing files. Present add/update imports in the same flush may still be applied. The user must restore files on disk, or restore and remove a small, deliberate batch if they intend to propagate deletes.
 
 5. **Export guard (`exporting` flag + `suppressExportDepth` counter).** When exporting or making disk-originated changes, suppress the change listener to avoid feedback loops. Use `withSuppressedExport()` for nested operations.
 
 6. **ImmutableString unwrapping.** Automerge may return content fields wrapped as `ImmutableString { val: "..." }` instead of a plain string. Always use `unwrapContent()` from `lib.ts`.
 
-7. **Per-key settings merge.** When importing `settings.json` or `models.json`, use `mergeSettingsIntoDoc()` then `applyJsonMergeInPlace()` which does per-key writes. This preserves CRDT semantics.
+7. **Per-key settings merge.** When importing `settings.json` or `models.json`, use `applyJsonMergeInPlace()` for per-key writes. `mergeSettingsIntoDoc()` is a pure comparison helper for tests and non-proxy callers. Per-key writes preserve CRDT semantics.
 
 8. **`pi-sync` is always local-only.** The document is created with `localOnly: { "extensions/pi-sync": [hostname] }`. `shouldSync()` also explicitly rejects pi-sync keys via `isPiSyncExtensionKey()`.
 

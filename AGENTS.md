@@ -10,7 +10,7 @@ prompts in sync across machines.
 extensions/pi-sync/
 ├── index.ts          # Extension entry point — commands, repo lifecycle, watchers
 ├── lib.ts            # Pure functions & types, testable without Automerge/WASM
-├── lib.test.ts       # Unit tests for lib.ts (vitest, 105 tests)
+├── lib.test.ts       # Unit tests for lib.ts (vitest)
 ├── types.ts          # TypeScript interfaces (re-export / documentation)
 ├── package.json      # Dependencies: @automerge/*, ws, vitest
 └── README.md         # User-facing docs
@@ -33,8 +33,10 @@ extensions/pi-sync/
    accidental cluster-wide wipe.
 
 4. **Mass-delete brake.** If more than `MASS_DELETE_LIMIT` (5) files vanish in a
-   single watcher flush, the entire batch is aborted. The user must restore files on
-   disk or use `sync:trash empty <path>` per file to confirm.
+   single watcher flush, the deletion pass is aborted and no tombstones are created
+   for those missing files. Present add/update imports in the same flush may still be
+   applied. The user must restore files on disk, or restore and remove a small,
+   deliberate batch if they intend to propagate deletes.
 
 5. **Export guard (`exporting` flag + `suppressExportDepth` counter).** When exporting
    or making disk-originated changes, suppress the change listener to avoid feedback
@@ -45,8 +47,9 @@ extensions/pi-sync/
    `unwrapContent()` from `lib.ts`.
 
 7. **Per-key settings merge.** When importing `settings.json` or `models.json`,
-   use `mergeSettingsIntoDoc()` then `applyJsonMergeInPlace()` which does per-key
-   writes. This preserves CRDT semantics.
+   use `applyJsonMergeInPlace()` for per-key writes. `mergeSettingsIntoDoc()` is a
+   pure comparison helper for tests and non-proxy callers. Per-key writes preserve
+   CRDT semantics.
 
 8. **`pi-sync` is always local-only.** The document is created with
    `localOnly: { "extensions/pi-sync": [hostname] }`. `shouldSync()` also
@@ -74,7 +77,7 @@ npx vitest run        # single run
 npx vitest            # watch mode
 ```
 
-**105 tests** in `lib.test.ts` covering:
+`lib.test.ts` covers:
 
 | Area | Coverage |
 |---|---|

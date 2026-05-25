@@ -7,7 +7,7 @@ npx vitest run      # single run
 npx vitest          # watch mode
 ```
 
-At the time of writing there are **105 tests** in `lib.test.ts` covering:
+`lib.test.ts` covers:
 
 | Area | Coverage |
 |---|---|

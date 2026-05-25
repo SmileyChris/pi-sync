@@ -4,7 +4,7 @@
 extensions/pi-sync/
 ├── index.ts          # Extension entry point — commands, repo lifecycle, watchers
 ├── lib.ts            # Pure functions & types, testable without Automerge/WASM
-├── lib.test.ts       # Unit tests for lib.ts (vitest, 105 tests)
+├── lib.test.ts       # Unit tests for lib.ts (vitest)
 ├── types.ts          # TypeScript interfaces (re-export / documentation)
 ├── package.json      # Dependencies: @automerge/*, ws, vitest
 ├── zensical.toml     # Documentation site config

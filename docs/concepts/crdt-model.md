@@ -10,7 +10,7 @@ Forgetting to unwrap is a frequent source of subtle bugs (`x.startsWith` undefin
 
 ## Per-key settings merge
 
-When importing `settings.json` or `models.json` into the doc, pi-sync uses `mergeSettingsIntoDoc()` followed by `applyJsonMergeInPlace()`, which writes individual keys rather than replacing the whole object. This preserves Automerge's per-key CRDT semantics, so two peers editing different keys in `settings.json` concurrently will merge cleanly instead of one overwriting the other.
+When importing `settings.json` or `models.json` into the doc, pi-sync uses `applyJsonMergeInPlace()`, which writes individual keys rather than replacing the whole object. `mergeSettingsIntoDoc()` remains as a pure comparison helper for tests and non-proxy callers. Per-key writes preserve Automerge's CRDT semantics, so two peers editing different keys in `settings.json` concurrently will merge cleanly instead of one overwriting the other.
 
 ## See also
 

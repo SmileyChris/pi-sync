@@ -6,7 +6,6 @@ All commands are slash-commands inside pi.
 |----------------------------|------------------------------------------------------|
 | `/sync:status`             | Show sync state, peers, document info                |
 | `/sync:info`               | Show your document URL (share to pair)               |
-| `/sync:invite`             | Alias for `/sync:info`                               |
 | `/sync:import <url>`       | Join an existing sync network                       |
 | `/sync:unlink`             | Detach from the network, start fresh                 |
 | `/sync:peers list`         | List configured peers (with connectivity)            |

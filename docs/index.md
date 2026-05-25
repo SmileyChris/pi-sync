@@ -19,7 +19,7 @@ The `pi-sync` extension itself is **never** synced — it is skipped by file col
 pi-sync only watches files under `~/.pi/agent/`. Anything outside that tree is out of scope:
 
 - **Pi-managed data outside `~/.pi/agent/`** — databases, caches, and runtime state that live elsewhere (e.g. under `~/.pi/`) are not synced. Each machine builds its own from local sessions.
-- **Extension runtime data** — any files or databases an extension creates at runtime (indexes, logs, local-only config). Extensions are synced as source code; their runtime output is not.
+- **Extension runtime data** — generated databases, logs, caches, `node_modules/`, dot-directories, and unsupported file types are not synced. Supported code and asset files under an extension directory are synced.
 - **Machine-specific config** — peer lists, port numbers, Automerge doc URLs. These live in `~/.config/pi-sync/` and are never shared.
 
 ## Next steps
