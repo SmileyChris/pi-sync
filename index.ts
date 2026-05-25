@@ -297,8 +297,9 @@ function purgeFromTrash(fileKey: string) {
 }
 
 function saveDocUrl(url: string) {
-  ensureDir(CONFIG_DIR);
-  fs.writeFileSync(DOC_URL_PATH, url, "utf-8");
+  // Atomic write: a crash mid-write here would leave an empty file and
+  // the next start would treat us as un-paired, dropping doc identity.
+  atomicWriteFile(DOC_URL_PATH, url);
 }
 
 function loadDocUrl(): string | null {
@@ -993,20 +994,15 @@ export default async function (pi: ExtensionAPI) {
   state.config = loadConfig();
 
   // Write default config if missing
-  ensureDir(CONFIG_DIR);
   if (!fs.existsSync(CONFIG_PATH)) {
-    fs.writeFileSync(
-      CONFIG_PATH,
-      JSON.stringify(DEFAULT_SYNC_CONFIG, null, 2) + "\n",
-    );
+    atomicWriteFile(CONFIG_PATH, JSON.stringify(DEFAULT_SYNC_CONFIG, null, 2) + "\n");
   }
 
   // ── Commands (available immediately, before repo init) ────────────
 
-  /** Write updated config to disk */
+  /** Write updated config to disk (atomic). */
   function saveConfig() {
-    ensureDir(CONFIG_DIR);
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(state.config, null, 2) + "\n");
+    atomicWriteFile(CONFIG_PATH, JSON.stringify(state.config, null, 2) + "\n");
   }
 
   pi.registerCommand("sync:status", {
