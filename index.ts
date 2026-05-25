@@ -85,6 +85,7 @@ const hostname = os.hostname();
 const WATCH_DEBOUNCE_MS = 500;
 const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
+const RECENT_REMOTE_CHANGES_CAP = 50;    // ring-buffer cap for the footer/status hint
 
 type SyncState = {
   config: SyncConfig;
@@ -867,9 +868,15 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       return;
     }
     const dirty = dirtyKeysFromPatches(patches);
-    // Deduplicate: only add keys not already in state.recentRemoteChanges
+    // Deduplicate and cap: only add keys not already in
+    // state.recentRemoteChanges, and drop oldest entries past the cap so
+    // a long-running session doesn't grow the array unboundedly.
     for (const k of dirty) {
-      if (!state.recentRemoteChanges.includes(k)) state.recentRemoteChanges.push(k);
+      if (state.recentRemoteChanges.includes(k)) continue;
+      state.recentRemoteChanges.push(k);
+      if (state.recentRemoteChanges.length > RECENT_REMOTE_CHANGES_CAP) {
+        state.recentRemoteChanges.shift();
+      }
     }
     exportKeys(doc, dirty);
   });
