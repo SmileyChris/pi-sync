@@ -26,6 +26,7 @@
  */
 
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { PeerId } from "@automerge/automerge-repo";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -118,33 +119,38 @@ type SyncState = {
   pendingInstalls: Set<string>;
 };
 
-const state: SyncState = ((globalThis as any).__piSyncState ??=
-  Object.seal({
-    repo: null,
-    handle: null,
-    wss: null,
-    watcher: null,
-    ImmutableString: null,
-    wsConnectedPeers: new Map(),
-    tcpReachablePeers: new Set(),
-    exporting: false,
-    suppressExportDepth: 0,
-    activeUi: null,
-    crashGuardInstalled: false,
-    initialSyncReady: false,
-    initInProgress: false,
-    standbyMode: false,
-    pendingChanges: new Set(),
-    watchTimer: null,
-    renderTimer: null,
-    tuiRef: null,
-    currentCtx: null,
-    purgeInterval: null,
-    probeInterval: null,
-    lastRemoteChangeTime: 0,
-    recentRemoteChanges: [],
-    pendingInstalls: new Set(),
-  } as SyncState)) as SyncState;
+// Symbol key so we don't collide with anyone else stashing things on
+// globalThis. Symbol.for so multiple jiti-loaded copies of this module
+// resolve to the same singleton.
+const STATE_KEY = Symbol.for("pi-sync:state");
+type StateHost = typeof globalThis & { [STATE_KEY]?: SyncState };
+
+const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
+  repo: null,
+  handle: null,
+  wss: null,
+  watcher: null,
+  ImmutableString: null,
+  wsConnectedPeers: new Map(),
+  tcpReachablePeers: new Set(),
+  exporting: false,
+  suppressExportDepth: 0,
+  activeUi: null,
+  crashGuardInstalled: false,
+  initialSyncReady: false,
+  initInProgress: false,
+  standbyMode: false,
+  pendingChanges: new Set(),
+  watchTimer: null,
+  renderTimer: null,
+  tuiRef: null,
+  currentCtx: null,
+  purgeInterval: null,
+  probeInterval: null,
+  lastRemoteChangeTime: 0,
+  recentRemoteChanges: [],
+  pendingInstalls: new Set(),
+}));
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
@@ -779,7 +785,9 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   state.repo = new Repo({
     network: adapters,
     storage: new NodeFSStorageAdapter(AM_STORAGE),
-    peerId: `pi-sync-${hostname}`,
+    // PeerId is a branded string in @automerge/automerge-repo; the brand
+    // is structural-only, no runtime tag, so the cast is safe.
+    peerId: `pi-sync-${hostname}` as PeerId,
   });
 
   // ── Find or create document ───────────────────────────────────────
@@ -1208,7 +1216,9 @@ export default async function (pi: ExtensionAPI) {
           Math.min(buildItems().length + 2, 15),
           getSettingsListTheme(),
           (id, newValue) => {
-            const key = id as keyof SyncConfig;
+            // Only the boolean sync* toggles are exposed in buildItems();
+            // port/peers aren't reachable from this panel.
+            const key = id as "syncSettings" | "syncExtensions" | "syncSkills" | "syncModels" | "syncPrompts";
             config[key] = (newValue === "on");
             saveConfig();
             // Update the list item in-place

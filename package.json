@@ -4,7 +4,9 @@
   "private": true,
   "description": "P2P sync for pi coding agent settings via Automerge CRDTs over Tailscale",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "test": "vitest run",
@@ -21,6 +23,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/ws": "^8.18.1",
     "vitest": "^3.0.0"
   }
 }
