@@ -111,6 +111,11 @@ let purgeInterval: ReturnType<typeof setInterval> | null = null;
 const WATCH_DEBOUNCE_MS = 500;
 const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+// Remote-change tracking for the footer widget and /sync:status
+let lastRemoteChangeTime = 0;
+let recentRemoteChanges: string[] = [];
+const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
+
 // ── Peer probing ─────────────────────────────────────────────────────
 
 /** Quick TCP connect to check if a peer has pi-sync running */
@@ -755,11 +760,20 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     if (suppressExportDepth > 0) return;
     if (isDocEmpty(doc)) return;
     const patches: any[] = payload?.patches ?? [];
+
+    // Track remote changes for the footer widget and /sync:status
+    lastRemoteChangeTime = Date.now();
     if (patches.length === 0) {
+      recentRemoteChanges = [];
       exportAllFiles(doc);
       return;
     }
-    exportKeys(doc, dirtyKeysFromPatches(patches));
+    const dirty = dirtyKeysFromPatches(patches);
+    // Deduplicate: only add keys not already in recentRemoteChanges
+    for (const k of dirty) {
+      if (!recentRemoteChanges.includes(k)) recentRemoteChanges.push(k);
+    }
+    exportKeys(doc, dirty);
   });
 
   // Wait for the doc to reach "ready" before doing any export work.
@@ -912,6 +926,21 @@ export default async function (pi: ExtensionAPI) {
         `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts`,
         `Local-only: \`${Object.keys(doc?.localOnly ?? {}).length}\` entries`,
       ];
+
+      // Recent remote changes
+      if (recentRemoteChanges.length > 0 && Date.now() - lastRemoteChangeTime < REFRESH_ICON_DURATION_MS) {
+        const ago = Math.round((Date.now() - lastRemoteChangeTime) / 1000);
+        const agoStr = ago < 10 ? "just now" : `${ago}s ago`;
+        lines.push(``);
+        lines.push(`🔄 Last sync (${agoStr}) — ${recentRemoteChanges.length} change(s):`);
+        for (const k of recentRemoteChanges.slice(0, 15)) {
+          lines.push(`    \`${k}\``);
+        }
+        if (recentRemoteChanges.length > 15) {
+          lines.push(`    … and ${recentRemoteChanges.length - 15} more`);
+        }
+      }
+
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
@@ -1384,9 +1413,15 @@ export default async function (pi: ExtensionAPI) {
     if (standbyMode) return "⛓️  standby";
     const total = config.peers.length;
     const wsOnline = config.peers.filter((p) => wsConnectedPeers.has(peerHost(p))).length;
-    if (total === 0) return "🔗";
-    if (wsOnline > 0) return `🔗 ${wsOnline} synced`;
-    return `🔗 ${total}`;
+    const showRefresh = Date.now() - lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
+
+    let label: string;
+    if (total === 0) label = "🔗";
+    else if (wsOnline > 0) label = `🔗 ${wsOnline}`;
+    else label = `🔗 ${total}`;
+
+    if (showRefresh && recentRemoteChanges.length > 0) label += ` 🔄`;
+    return label;
   }
 
   // ── Custom footer timer (triggers re-render every 5s) ────────────
