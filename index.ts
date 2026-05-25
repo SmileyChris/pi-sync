@@ -511,14 +511,14 @@ async function flushPendingChanges() {
 
   // Mass-delete brake: refuse to propagate large bursts. The user likely
   // ran `rm -rf` / `git clean` / similar — better to require them to
-  // resurrect on disk (or use /sync:trash empty per file) than silently
+  // resurrect on disk and make a smaller deliberate delete than silently
   // wipe the cluster.
   let blockedDeletions = false;
   if (deletions.length > MASS_DELETE_LIMIT) {
     console.error(
       `[pi-sync] Mass-delete brake: ${deletions.length} files vanished in one flush ` +
-      `(limit ${MASS_DELETE_LIMIT}). Holding tombstones. Restore the files on disk ` +
-      `to dismiss, or run \`/sync:trash empty <path>\` per file to confirm.`,
+      `(limit ${MASS_DELETE_LIMIT}). No tombstones were created for those missing files. ` +
+      `Restore them on disk, or restore and remove a smaller deliberate batch to propagate deletes.`,
     );
     blockedDeletions = true;
   }
