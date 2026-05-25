@@ -32,6 +32,7 @@ import { Container, type SettingItem, SettingsList, Text, truncateToWidth, visib
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { execSync } from "node:child_process";
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -115,6 +116,10 @@ const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let lastRemoteChangeTime = 0;
 let recentRemoteChanges: string[] = [];
 const REFRESH_ICON_DURATION_MS = 30_000; // show 🔄 for 30 s after last remote pull
+
+// Track extension dirs whose files were written during an export batch.
+// Processed after the batch completes to run npm install if needed.
+const pendingInstalls = new Set<string>();
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
@@ -390,6 +395,9 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   const content = unwrapContent(synced) ?? "";
   if (readFileOrEmpty(absPath) === content) return false;
   atomicWriteFile(absPath, content);
+  // Track extension dirs that need a dependency check post-export
+  const extMatch = key.match(/^extensions\/([^/]+)\//);
+  if (extMatch) pendingInstalls.add(extMatch[1]);
   return true;
 }
 
@@ -405,6 +413,38 @@ function isDocEmpty(doc: PiConfigDocument): boolean {
   );
 }
 
+/** After exporting a batch of files, check any extension dirs that had
+ *  files written. If the extension has a package.json with dependencies
+ *  but no node_modules, run `npm install --ignore-scripts` so pi doesn't
+ *  crash when loading the extension. */
+function installMissingExtensionDeps() {
+  if (pendingInstalls.size === 0) return;
+  for (const extName of pendingInstalls) {
+    const extDir = path.join(PI_DIR, "extensions", extName);
+    const pkgPath = path.join(extDir, "package.json");
+    const nmDir = path.join(extDir, "node_modules");
+    try {
+      if (!fs.existsSync(pkgPath)) continue;
+      if (fs.existsSync(nmDir)) continue;
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+      if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) continue;
+      console.log(`[pi-sync] Installing deps for ${extName}…`);
+      execSync("npm install --ignore-scripts", {
+        cwd: extDir,
+        stdio: "pipe",
+        timeout: 60_000,
+      });
+      console.log(`[pi-sync] Dependencies installed for ${extName}`);
+    } catch (err: any) {
+      console.error(
+        `[pi-sync] Failed to install deps for ${extName}:`,
+        err?.message ?? err,
+      );
+    }
+  }
+  pendingInstalls.clear();
+}
+
 function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
   exporting = true;
   try {
@@ -412,6 +452,7 @@ function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
     for (const key of keys) {
       if (exportFile(doc, key)) changed = true;
     }
+    installMissingExtensionDeps();
     return changed;
   } finally {
     exporting = false;
