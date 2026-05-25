@@ -118,6 +118,12 @@ type SyncState = {
   recentRemoteChanges: string[];
   pendingInstalls: Set<string>;
   installRunning: boolean;
+  // Snapshot of config.peers taken when initRepo wired up the network
+  // adapters. The running Automerge repo binds its peer list at
+  // construction; later /sync:peers add|remove edits config.peers and
+  // disk, but the live adapter set won't change until /reload. This
+  // snapshot lets /sync:status surface "edited since last reload".
+  peersAtInit: string[];
 };
 
 // Symbol key so we don't collide with anyone else stashing things on
@@ -153,6 +159,7 @@ const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
   recentRemoteChanges: [],
   pendingInstalls: new Set(),
   installRunning: false,
+  peersAtInit: [],
 }));
 
 // ── Peer probing ─────────────────────────────────────────────────────
@@ -803,6 +810,8 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     if (peerHost(peer) === hostname) continue;
     adapters.push(new WebSocketClientAdapter(`ws://${peer}`));
   }
+  // Snapshot for the "edited since last reload" hint in /sync:status.
+  state.peersAtInit = [...state.config.peers];
 
   // ── Create repo ───────────────────────────────────────────────────
 
@@ -1005,6 +1014,17 @@ export default async function (pi: ExtensionAPI) {
     atomicWriteFile(CONFIG_PATH, JSON.stringify(state.config, null, 2) + "\n");
   }
 
+  /** True when /sync:peers add|remove has edited the peer list since the
+   *  running repo was constructed. The live WebSocket adapter set is
+   *  frozen at initRepo time, so edits don't take effect until /reload. */
+  function peersDivergedFromInit(): boolean {
+    if (!state.handle) return false;
+    if (state.peersAtInit.length !== state.config.peers.length) return true;
+    const init = new Set(state.peersAtInit);
+    for (const p of state.config.peers) if (!init.has(p)) return true;
+    return false;
+  }
+
   pi.registerCommand("sync:status", {
     description: "Show pi-sync status, peers, and sync toggles",
     handler: async (_args, ctx) => {
@@ -1020,10 +1040,12 @@ export default async function (pi: ExtensionAPI) {
           ? state.config.peers.map((p) => {
               const h = peerHost(p);
               const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
-              return `  ${mark} \`${p}\``;
+              const pending = state.peersAtInit.includes(p) ? "" : " _(pending /reload)_";
+              return `  ${mark} \`${p}\`${pending}`;
             })
           : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
         ),
+        ...(peersDivergedFromInit() ? [`  _peer list edited since last reload — run \`/reload\` to apply_`] : []),
         ``,
         `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts`,
         ``,
@@ -1114,7 +1136,7 @@ export default async function (pi: ExtensionAPI) {
           state.wsConnectedPeers.delete(targetHost);
           state.tcpReachablePeers.delete(targetHost);
           saveConfig();
-          ctx.ui.notify(`Removed \`${target}\` from peers.`, "info");
+          ctx.ui.notify(`Removed \`${target}\`. Run \`/reload\` to disconnect from the running session.`, "info");
         }
         return;
       }
