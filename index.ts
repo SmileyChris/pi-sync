@@ -79,16 +79,91 @@ import {
 
 // ── Peer probing ─────────────────────────────────────────────────────
 
-/** Quick TCP connect to check if a peer has pi-sync running */
+type NetModule = typeof import("node:net");
+
+let netModulePromise: Promise<NetModule> | null = null;
+
+function loadNet(): Promise<NetModule> {
+  return (netModulePromise ??= import("node:net"));
+}
+
+function normalizeProbePort(port: number): number | null {
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+/** Quick TCP connect to check if a peer's sync port is reachable. */
 async function probePeer(host: string, port: number, timeoutMs = 2000): Promise<boolean> {
-  const net = await import("node:net");
+  const safePort = normalizeProbePort(port);
+  if (!host || safePort == null) return false;
+
+  const net = await loadNet();
   return new Promise((resolve) => {
     const socket = new net.Socket();
-    socket.setTimeout(timeoutMs);
-    socket.on("connect", () => { socket.destroy(); resolve(true); });
-    socket.on("error", () => { socket.destroy(); resolve(false); });
-    socket.on("timeout", () => { socket.destroy(); resolve(false); });
-    socket.connect(port, host);
+    let settled = false;
+
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("timeout", onTimeout);
+      socket.destroy();
+      resolve(ok);
+    };
+    const onConnect = () => finish(true);
+    const onError = () => finish(false);
+    const onTimeout = () => finish(false);
+
+    socket.setTimeout(Math.max(1, timeoutMs));
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("timeout", onTimeout);
+    socket.unref?.();
+
+    try {
+      socket.connect(safePort, host);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+/** Bind probe for the local sync server port. Faster and more exact than TCP connect. */
+async function canBindLocalPort(port: number): Promise<boolean> {
+  const safePort = normalizeProbePort(port);
+  if (safePort == null) return false;
+
+  const net = await loadNet();
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    let settled = false;
+
+    const cleanup = () => {
+      server.off("error", onError);
+      server.off("listening", onListening);
+    };
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (server.listening) {
+        server.close(() => resolve(ok));
+      } else {
+        resolve(ok);
+      }
+    };
+    const onError = () => finish(false);
+    const onListening = () => finish(true);
+
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.unref?.();
+
+    try {
+      server.listen({ port: safePort, exclusive: true });
+    } catch {
+      finish(false);
+    }
   });
 }
 
@@ -109,8 +184,14 @@ async function probeAllPeers() {
 
 function startProbing() {
   if (state.probeInterval) return;
-  probeAllPeers(); // immediate first probe
-  state.probeInterval = setInterval(probeAllPeers, 15_000); // every 15s
+  const runProbe = () => {
+    void probeAllPeers().catch((e: any) =>
+      console.error("[pi-sync] Peer probe failed:", e?.message ?? e),
+    );
+  };
+  runProbe(); // immediate first probe
+  state.probeInterval = setInterval(runProbe, 15_000); // every 15s
+  (state.probeInterval as any).unref?.();
 }
 function stopProbing() {
   if (state.probeInterval) { clearInterval(state.probeInterval); state.probeInterval = null; }
@@ -840,14 +921,33 @@ async function shutdownRepo() {
 
 // ── Watchdog: waits for the primary instance to exit, then takes over ─
 
+async function waitForLocalSyncSocketClose(port: number): Promise<"closed" | "unreachable"> {
+  const { default: WebSocket } = await import("ws");
+  return new Promise((resolve) => {
+    let opened = false;
+    let settled = false;
+    const ws = new WebSocket(`ws://localhost:${port}`);
+    const finish = (result: "closed" | "unreachable") => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      resolve(result);
+    };
+    ws.once("open", () => { opened = true; });
+    ws.once("close", () => finish(opened ? "closed" : "unreachable"));
+    ws.once("error", () => finish(opened ? "closed" : "unreachable"));
+  });
+}
+
 async function watchAndTakeOver(pi: ExtensionAPI) {
   state.standbyMode = true;
-  const { default: WebSocket } = await import("ws");
-  await new Promise<void>((resolve) => {
-    const ws = new WebSocket(`ws://localhost:${state.config.port}`);
-    ws.on("close", () => resolve());
-    ws.on("error", () => resolve());
-  });
+  const port = normalizeProbePort(state.config.port);
+  if (port == null) {
+    state.standbyMode = false;
+    console.error(`[pi-sync] Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`);
+    return;
+  }
+  const waitResult = await waitForLocalSyncSocketClose(port);
 
   // Jitter: wait 50–500 ms before attempting to take over so multiple
   // standbys don't race for the port at the exact same instant.
@@ -855,7 +955,15 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   await new Promise((r) => setTimeout(r, jitterMs));
 
   // Did another standby already claim the port while we waited?
-  if (await probePeer("localhost", state.config.port, 500)) {
+  if (!(await canBindLocalPort(port))) {
+    if (waitResult === "unreachable") {
+      state.standbyMode = false;
+      console.error(
+        `[pi-sync] Port ${port} is in use, but no pi-sync WebSocket responded. ` +
+        `Edit ~/.config/pi-sync/config.json to change.`,
+      );
+      return;
+    }
     console.log(
       `[pi-sync] Another instance took port ${state.config.port} — resuming standby`,
     );
@@ -882,7 +990,7 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
 
 // ── Extension entry point ─────────────────────────────────────────────
 
-export default async function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
   state.config = loadConfig();
 
   // Write default config if missing
@@ -1421,12 +1529,13 @@ export default async function (pi: ExtensionAPI) {
   // Register these before init so they're always active (even when
   // waiting for takeover).
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     state.activeUi = ctx.ui;
     state.currentCtx = ctx;
     installFooter(ctx.ui);
+    startSyncInBackground(pi);
 
-    // No importAllFiles here: initRepo already pushed local files during
+    // No importAllFiles here: initRepo pushes local files during sync
     // startup, and the fs.watch loop catches any changes made while pi
     // is running. Re-importing on every /new churned through hundreds of
     // files just to short-circuit on syncedFileContentMatches.
@@ -1459,9 +1568,9 @@ export default async function (pi: ExtensionAPI) {
       await shutdownRepo();
     }
   });
+}
 
-  // ── Start syncing (or wait for takeover) ──────────────────────────
-  //
+function startSyncInBackground(pi: ExtensionAPI) {
   // Re-entry guard: when pi reloads extensions inside the same process
   // (e.g. on `/new`), the module body re-executes against the singleton
   // `state` on globalThis. Three flags say "the previous instance still
@@ -1469,36 +1578,45 @@ export default async function (pi: ExtensionAPI) {
   //   1. state.standbyMode — a watchAndTakeOver is already in flight,
   //      don't interfere (it will set state.standbyMode=false on takeover).
   //   2. state.handle — repo already initialized, port already bound.
-  //   3. state.initInProgress — initRepo or the probePeer dispatch below
+  //   3. state.initInProgress — initRepo or the local port probe below
   //      is mid-flight; state.handle / state.standbyMode aren't observable
   //      yet but will be by the time this flag clears.
-  // Without this, probePeer below finds our own previous wss, calls
+  // Without this, the local port probe below finds our own previous wss, calls
   // watchAndTakeOver, and we self-reenter standby forever.
   if (state.standbyMode || state.handle || state.initInProgress) return;
 
-  // Mark sync so a parallel reload that lands inside the probePeer await
-  // (or before initRepo's own marker takes effect) sees us as in-progress
-  // and bails out via the guard above.
-  state.initInProgress = true;
-  try {
-    if (await probePeer("localhost", state.config.port, 500)) {
-      // Background watchdog — pi continues immediately, widget shows status.
-      // When the other instance exits it terminates all clients, causing
-      // watchAndTakeOver's WebSocket to close and auto-take-over.
-      // watchAndTakeOver's first synchronous step sets state.standbyMode,
-      // so the guard takes over from initInProgress as soon as the .catch
-      // below returns.
-      watchAndTakeOver(pi).catch((e: any) =>
-        console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
-      );
-    } else {
-      await initRepo(pi);
-      startFileWatcher();
-      startPurgeTimer();
+  void (async () => {
+    // Mark sync so a parallel reload that lands inside the port probe await
+    // (or before initRepo's own marker takes effect) sees us as in-progress
+    // and bails out via the guard above.
+    state.initInProgress = true;
+    try {
+      const port = normalizeProbePort(state.config.port);
+      if (port == null) {
+        console.error(`[pi-sync] Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`);
+        return;
+      }
+
+      if (!(await canBindLocalPort(port))) {
+        // Background watchdog — pi continues immediately, widget shows status.
+        // When the other instance exits it terminates all clients, causing
+        // watchAndTakeOver's WebSocket to close and auto-take-over.
+        // watchAndTakeOver's first synchronous step sets state.standbyMode,
+        // so the guard takes over from initInProgress as soon as the .catch
+        // below returns.
+        watchAndTakeOver(pi).catch((e: any) =>
+          console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+        );
+      } else {
+        await initRepo(pi);
+        startFileWatcher();
+        startPurgeTimer();
+        startProbing();
+      }
+    } catch (e: any) {
+      console.error("[pi-sync] Failed to initialize sync repo:", e?.message ?? e);
+    } finally {
+      state.initInProgress = false;
     }
-  } catch (e: any) {
-    console.error("[pi-sync] Failed to initialize sync repo:", e?.message ?? e);
-  } finally {
-    state.initInProgress = false;
-  }
+  })();
 }
