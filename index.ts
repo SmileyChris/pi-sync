@@ -32,6 +32,14 @@ import { Container, type SettingItem, SettingsList, Text } from "@earendil-works
 import { installFooter } from "./footer";
 import * as fs from "node:fs";
 import * as path from "node:path";
+
+// ── Debug logging ────────────────────────────────────────────────────
+const DEBUG_LOG = "/tmp/pi-sync-debug.log";
+function debugLog(msg: string) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}\n`;
+  try { fs.appendFileSync(DEBUG_LOG, line); } catch {}
+}
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -728,11 +736,15 @@ function installCrashGuard() {
 
   const onCrash = (err: unknown, kind: "exception" | "rejection") => {
     const msg = (err as any)?.message ?? String(err);
+    const stack = (err as any)?.stack ?? 'no stack';
+    debugLog(`crash-guard: ${kind} fired — ${msg}`);
+    debugLog(`crash-guard: stack: ${String(stack).split('\\n').slice(0, 5).join(' ← ')}`);
 
     // Network errors and ws disconnect-on-unopened-socket — both are
     // recoverable and expected when peers go offline. Prevent pi's
     // handler (which fires after ours) from calling process.exit(1).
     if (isNetworkError(err) || /WebSocket was closed before/.test(msg)) {
+      debugLog(`crash-guard: recognized as recoverable, stubbing process.exit`);
       console.error(`[pi-sync] ${kind}: ${msg} (not fatal)`);
       stubProcessExit();
       return;
@@ -761,6 +773,7 @@ function installCrashGuard() {
 }
 
 async function initRepo(pi: ExtensionAPI): Promise<void> {
+  debugLog(`initRepo: START, peers=${JSON.stringify(state.config.peers)}, hostname=${hostname}`);
   // Synchronous guard set before any await — see SyncState.initInProgress.
   state.initInProgress = true;
   try {
@@ -786,9 +799,12 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // connection is aborted. With no listener, Node.js throws uncaught.
   // We add a no-op error listener before close() so the async error has
   // somewhere to go.
+  // Apply ws prototype patch before any adapters are created
+  debugLog(`initRepo: applying ws prototype close patch`);
   const _origWsClose = WS.prototype.close;
   WS.prototype.close = function (this: any, code?: number, reason?: Buffer) {
     if (this.readyState === WS.CONNECTING && this.listenerCount("error") === 0) {
+      debugLog(`ws-close-patch: CONNECTING socket, 0 error listeners — adding no-op`);
       this.on("error", () => {});
     }
     return _origWsClose.call(this, code, reason);
@@ -829,6 +845,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   for (const peer of state.config.peers) {
     if (peerHost(peer) === hostname) continue;
+    debugLog(`initRepo: creating adapter for ${peer}, hostname=${hostname}`);
     const adapter = new WebSocketClientAdapter(`ws://${peer}`);
     // Upstream bug: onError throws non-ECONNREFUSED errors (ETIMEDOUT,
     // ENOTFOUND, etc.) and disconnect() throws when the socket never
@@ -837,13 +854,23 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     // Wrap the instance methods to swallow these errors at the source.
     const origOnError = adapter.onError;
     adapter.onError = ((event: any) => {
+      const code = event?.error?.code || event?.code || '?';
+      debugLog(`onError-wrapped: called for ${peer}, code=${code}`);
       try { origOnError.call(adapter, event); }
-      catch (err: any) { console.error(`[pi-sync] Connection error to ${peer}: ${err?.message ?? err}`); }
+      catch (err: any) {
+        debugLog(`onError-wrapped: CAUGHT throw for ${peer}: ${err?.message ?? err}`);
+        console.error(`[pi-sync] Connection error to ${peer}: ${err?.message ?? err}`);
+      }
     }) as typeof adapter.onError;
     const origDisconnect = adapter.disconnect;
     adapter.disconnect = () => {
+      debugLog(`disconnect-wrapped: called for ${peer}`);
       try { origDisconnect.call(adapter); }
-      catch (err: any) { console.error(`[pi-sync] Disconnect error for ${peer}: ${err?.message ?? err}`); }
+      catch (err: any) {
+        debugLog(`disconnect-wrapped: CAUGHT for ${peer}: ${err?.message ?? err}`);
+        console.error(`[pi-sync] Disconnect error for ${peer}: ${err?.message ?? err}`);
+      }
+      debugLog(`disconnect-wrapped: completed for ${peer}`);
     };
     adapters.push(adapter);
   }
@@ -855,10 +882,9 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   state.repo = new Repo({
     network: adapters,
     storage: new NodeFSStorageAdapter(AM_STORAGE),
-    // PeerId is a branded string in @automerge/automerge-repo; the brand
-    // is structural-only, no runtime tag, so the cast is safe.
     peerId: `pi-sync-${hostname}` as PeerId,
   });
+  debugLog(`initRepo: Repo created with ${adapters.length} adapters — connections starting`);
 
   // ── Find or create document ───────────────────────────────────────
 
@@ -958,12 +984,14 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     }
   }
   state.initialSyncReady = true;
+  debugLog(`initRepo: COMPLETE — ready for sync`);
   } finally {
     state.initInProgress = false;
   }
 }
 
 async function shutdownRepo() {
+  debugLog(`shutdownRepo: START`);
   stopFileWatcher();
   stopProbing();
   stopPurgeTimer();
