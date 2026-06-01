@@ -800,15 +800,32 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // no listeners, Node.js throws uncaughtException.
   const _netModule = await import("node:net");
   const _origSocketConnect = _netModule.Socket.prototype.connect;
-  const _peerHosts = new Set(state.config.peers.map((p) => peerHost(p)));
-  const _peerPort = state.config.port;
+  const _peerTargets = new Set(state.config.peers.map((p) => {
+    const parsed = parsePeer(p);
+    const host = parsed?.host ?? peerHost(p);
+    const port = parsed?.port ?? state.config.port;
+    return `${host}:${port}`;
+  }));
   _netModule.Socket.prototype.connect = function (this: any, ...args: any[]) {
-    const port = typeof args[0] === "object" ? args[0].port : args[0];
-    const host = typeof args[0] === "object" ? args[0].host : args[1];
-    if (typeof host === "string" && port === _peerPort && _peerHosts.has(host)) {
-      // Always add a no-op handler — ws may add/remove its own listeners
-      // later, and the adapter's retry orphans old sockets with 0 listeners.
-      this.on("error", () => {});
+    // Node.js internals can pass a pre-normalized arguments array as args[0]
+    let normalizedArgs = args;
+    if (args.length === 1 && Array.isArray(args[0])) {
+      normalizedArgs = args[0];
+    }
+    const opts = typeof normalizedArgs[0] === "object" ? normalizedArgs[0] : null;
+    let port = opts?.port ?? normalizedArgs[0];
+    let host = opts?.host ?? normalizedArgs[1];
+    // net.connect(options) stores host/port on the Socket and calls
+    // connect() with no args — check this.host / this.port too.
+    if (!host && this.host) host = this.host;
+    if (!port && this.port) port = this.port;
+    if (typeof host === "string" && port !== undefined) {
+      const numericPort = Number(port);
+      const targetKey = `${host}:${numericPort}`;
+      if (_peerTargets.has(targetKey)) {
+        debugLog(`net-patch: adding error listener for ${host}:${port}`);
+        this.on("error", () => {});
+      }
     }
     return _origSocketConnect.apply(this, args as any);
   };
@@ -836,6 +853,22 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   const { NodeWSServerAdapter, WebSocketClientAdapter } = netModule;
 
+  // Patch WebSocketClientAdapter.prototype.connect to close the old socket
+  // and add a no-op error listener to it before it gets orphaned on reconnect.
+  const _origAdapterConnect = WebSocketClientAdapter.prototype.connect;
+  WebSocketClientAdapter.prototype.connect = function (this: any, peerId: any, peerMetadata: any) {
+    if (this.socket) {
+      debugLog(`adapter-connect-patch: closing old socket for ${this.url}`);
+      try {
+        this.socket.addEventListener("error", () => {});
+        this.socket.close();
+      } catch (err: any) {
+        debugLog(`adapter-connect-patch: failed to close old socket: ${err?.message ?? err}`);
+      }
+    }
+    return _origAdapterConnect.call(this, peerId, peerMetadata);
+  };
+
   // ── WebSocket server ──────────────────────────────────────────────
 
   state.wss = new WebSocketServer({ port: state.config.port });
@@ -853,6 +886,9 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   // Track real WS connections (inbound = another peer connected to us)
   state.wss.on("connection", (ws: any, req: any) => {
+    // Prevent ECONNRESET/EPIPE uncaught crashes on incoming client connections
+    ws.on("error", () => {});
+
     const remoteAddr = req.socket?.remoteAddress || "unknown";
     const host = remoteAddr.replace(/^::ffff:/, "");
     state.wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
@@ -1050,9 +1086,15 @@ async function waitForLocalSyncSocketClose(port: number): Promise<"closed" | "un
     let opened = false;
     let settled = false;
     const ws = new WebSocket(`ws://localhost:${port}`);
+    const timer = setTimeout(() => {
+      finish(opened ? "closed" : "unreachable");
+    }, 5000); // 5s watchdog timeout
+    (timer as any).unref?.();
+
     const finish = (result: "closed" | "unreachable") => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       try { ws.close(); } catch {}
       resolve(result);
     };
