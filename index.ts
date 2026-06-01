@@ -686,24 +686,41 @@ function quarantineStorage(): string | null {
   }
 }
 
-/** Install a one-shot guard against Automerge wasm panics. Without this,
- *  a PatchLogMismatch (or follow-on "recursive use of an object") tears
- *  down the whole pi process. The guard keeps pi alive, stops sync, and
- *  quarantines storage so the next start is clean. */
+function isNetworkError(err: unknown): boolean {
+  if (!err) return false;
+  const e = err as { code?: unknown; message?: unknown };
+  const s = String(e.code ?? e.message ?? err);
+  return /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ECONNRESET|EPIPE/.test(s);
+}
+
+/** Install a one-shot guard against Automerge wasm panics and network
+ *  connection failures. Without this, a PatchLogMismatch or an
+ *  ETIMEDOUT to an offline peer tears down the whole pi process.
+ *  The guard keeps pi alive: for Automerge errors it quarantines
+ *  storage and stops sync; for network errors it logs and continues
+ *  without quarantine (peers coming/going is expected in P2P). */
 function installCrashGuard() {
   if (state.crashGuardInstalled) return;
   state.crashGuardInstalled = true;
 
   const onCrash = (err: unknown, kind: "exception" | "rejection") => {
+    const msg = (err as any)?.message ?? String(err);
+
+    // Network connectivity errors — expected when peers go offline.
+    // Log a warning, don't quarantine, don't shut down.
+    if (isNetworkError(err)) {
+      console.error(`[pi-sync] ${kind}: ${msg} (peer unreachable — not fatal)`);
+      return;
+    }
+
     if (!isAutomergeError(err)) {
-      // Log and swallow. Re-throwing here would re-enter this same handler
-      // (uncaughtException loops on itself), so we leave the error to
-      // pi's own top-level handler / surface it via the log only. Avoid
-      // process.exit so other extensions aren't taken down by ours.
+      // Unknown error: log but don't re-throw (that would loop on
+      // uncaughtException). We leave the process alive — better to
+      // run with sync possibly broken than crash pi entirely.
       console.error(`[pi-sync] uncaught ${kind} (not automerge):`, err);
       return;
     }
-    const msg = (err as any)?.message ?? String(err);
+
     console.error(`[pi-sync] Automerge ${kind} caught:`, msg);
     const dest = quarantineStorage();
     void shutdownRepo().catch(() => {});
