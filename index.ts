@@ -771,13 +771,28 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   installCrashGuard();
 
   // Dynamic imports to avoid jiti/WASM top-level import issues
-  const [{ WebSocketServer }, { Repo, ImmutableString: IS }, { NodeFSStorageAdapter }, netModule] =
+  const [{ WebSocketServer, default: WS }, { Repo, ImmutableString: IS }, { NodeFSStorageAdapter }, netModule] =
     await Promise.all([
       import("ws"),
       import("@automerge/automerge-repo"),
       import("@automerge/automerge-repo-storage-nodefs"),
       import("@automerge/automerge-repo-network-websocket"),
     ]);
+
+  // Patch ws WebSocket.prototype.close to prevent uncaught exceptions
+  // when closing a CONNECTING socket. The adapter's disconnect() removes
+  // its error listener BEFORE calling close(), and ws asynchronously
+  // emits 'error' via emitErrorAndClose when the underlying TCP
+  // connection is aborted. With no listener, Node.js throws uncaught.
+  // We add a no-op error listener before close() so the async error has
+  // somewhere to go.
+  const _origWsClose = WS.prototype.close;
+  WS.prototype.close = function (this: any, code?: number, reason?: Buffer) {
+    if (this.readyState === WS.CONNECTING && this.listenerCount("error") === 0) {
+      this.on("error", () => {});
+    }
+    return _origWsClose.call(this, code, reason);
+  };
 
   // Store for use in importFile/exportFile
   state.ImmutableString = IS;
