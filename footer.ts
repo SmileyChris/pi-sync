@@ -23,7 +23,7 @@ export function getSyncLabel(): string {
   let label: string;
   if (total === 0) label = "🔗";
   else if (wsOnline > 0) label = `🔗 ${wsOnline}`;
-  else label = `🔗 ${total}`;
+  else label = `🔗`;
 
   if (showRefresh && state.recentRemoteChanges.length > 0) label += ` 🔄`;
   return label;
