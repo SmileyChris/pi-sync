@@ -792,6 +792,27 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       import("@automerge/automerge-repo-network-websocket"),
     ]);
 
+  // Monkey-patch net.Socket.prototype.connect to prevent raw TCP
+  // errors from orphaned WebSocket connections. The adapter's retry
+  // logic removes event listeners from the old WebSocket before
+  // creating a new one, but never terminates the old socket. Each
+  // orphaned TCP connection eventually times out (~2 min) and with
+  // no listeners, Node.js throws uncaughtException.
+  const _netModule = await import("node:net");
+  const _origSocketConnect = _netModule.Socket.prototype.connect;
+  const _peerHosts = new Set(state.config.peers.map((p) => peerHost(p)));
+  const _peerPort = state.config.port;
+  _netModule.Socket.prototype.connect = function (this: any, ...args: any[]) {
+    const port = typeof args[0] === "object" ? args[0].port : args[0];
+    const host = typeof args[0] === "object" ? args[0].host : args[1];
+    if (typeof host === "string" && port === _peerPort && _peerHosts.has(host)) {
+      // Always add a no-op handler — ws may add/remove its own listeners
+      // later, and the adapter's retry orphans old sockets with 0 listeners.
+      this.on("error", () => {});
+    }
+    return _origSocketConnect.apply(this, args as any);
+  };
+
   // Patch ws WebSocket.prototype.close to prevent uncaught exceptions
   // when closing a CONNECTING socket. The adapter's disconnect() removes
   // its error listener BEFORE calling close(), and ws asynchronously
