@@ -693,12 +693,35 @@ function isNetworkError(err: unknown): boolean {
   return /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ECONNRESET|EPIPE/.test(s);
 }
 
-/** Install a one-shot guard against Automerge wasm panics and network
- *  connection failures. Without this, a PatchLogMismatch or an
- *  ETIMEDOUT to an offline peer tears down the whole pi process.
- *  The guard keeps pi alive: for Automerge errors it quarantines
- *  storage and stops sync; for network errors it logs and continues
- *  without quarantine (peers coming/going is expected in P2P). */
+/** Stub process.exit so pi's uncaughtException handler (which fires
+ *  after ours) can't kill the process for a pi-sync error. Restored
+ *  on the next tick so normal exits still work. */
+let _stubRestoreTimer: ReturnType<typeof setTimeout> | null = null;
+function stubProcessExit() {
+  if ((process.exit as any)._stubbed) return; // already stubbed this cycle
+  const origExit = process.exit;
+  (process.exit as any) = ((code?: number) => {
+    if ((process.exit as any)._stubbed) {
+      console.error(`[pi-sync] Suppressed process.exit(${code})`);
+      return undefined as never;
+    }
+    return origExit(code);
+  }) as typeof process.exit;
+  (process.exit as any)._stubbed = true;
+  // Restore on next tick so Ctrl+C / quit / real errors can still exit
+  if (_stubRestoreTimer) clearTimeout(_stubRestoreTimer);
+  _stubRestoreTimer = setTimeout(() => {
+    process.exit = origExit;
+    _stubRestoreTimer = null;
+  }, 0);
+}
+
+/** Install a guard against crashes from Automerge wasm panics and
+ *  unreachable peers. Pi uses process.prependListener for its own
+ *  uncaughtException handler which calls process.exit(1). We must
+ *  also use prependListener to fire first. For recoverable errors
+ *  we stub out process.exit so pi's handler can't kill the process
+ *  for pi-sync errors (restored on next tick). */
 function installCrashGuard() {
   if (state.crashGuardInstalled) return;
   state.crashGuardInstalled = true;
@@ -706,32 +729,35 @@ function installCrashGuard() {
   const onCrash = (err: unknown, kind: "exception" | "rejection") => {
     const msg = (err as any)?.message ?? String(err);
 
-    // Network connectivity errors — expected when peers go offline.
-    // Log a warning, don't quarantine, don't shut down.
-    if (isNetworkError(err)) {
-      console.error(`[pi-sync] ${kind}: ${msg} (peer unreachable — not fatal)`);
+    // Network errors and ws disconnect-on-unopened-socket — both are
+    // recoverable and expected when peers go offline. Prevent pi's
+    // handler (which fires after ours) from calling process.exit(1).
+    if (isNetworkError(err) || /WebSocket was closed before/.test(msg)) {
+      console.error(`[pi-sync] ${kind}: ${msg} (not fatal)`);
+      stubProcessExit();
       return;
     }
 
     if (!isAutomergeError(err)) {
-      // Unknown error: log but don't re-throw (that would loop on
-      // uncaughtException). We leave the process alive — better to
-      // run with sync possibly broken than crash pi entirely.
-      console.error(`[pi-sync] uncaught ${kind} (not automerge):`, err);
+      // Unknown error: let pi decide whether to crash. We don't stub
+      // process.exit here — non-Automerge, non-network errors should
+      // still surface to the user.
+      console.error(`[pi-sync] uncaught ${kind}:`, err);
       return;
     }
 
     console.error(`[pi-sync] Automerge ${kind} caught:`, msg);
     const dest = quarantineStorage();
     void shutdownRepo().catch(() => {});
+    stubProcessExit();
     const note =
       `pi-sync hit an Automerge crash and stopped.${dest ? `\nStorage quarantined → \`${dest}\`` : ""}\n` +
       `Run \`/reload\` to restart sync. If the crash recurs, run \`/sync:unlink\` and re-import from a peer.`;
     try { state.activeUi?.notify(note, "warning"); } catch {}
   };
 
-  process.on("uncaughtException", (err) => onCrash(err, "exception"));
-  process.on("unhandledRejection", (reason) => onCrash(reason, "rejection"));
+  process.prependListener("uncaughtException", (err) => onCrash(err, "exception"));
+  process.prependListener("unhandledRejection", (reason) => onCrash(reason, "rejection"));
 }
 
 async function initRepo(pi: ExtensionAPI): Promise<void> {
