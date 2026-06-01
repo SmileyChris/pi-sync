@@ -1114,6 +1114,13 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
 // ── Extension entry point ─────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Allow disabling pi-sync without disabling all extensions.
+  // Set PI_SYNC_DISABLED=1 env var or create ~/.config/pi-sync/disabled.
+  if (process.env.PI_SYNC_DISABLED === "1" || fs.existsSync(path.join(CONFIG_DIR, "disabled"))) {
+    debugLog("pi-sync disabled via env var or flag file");
+    return;
+  }
+
   state.config = loadConfig();
 
   // Write default config if missing
