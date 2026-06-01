@@ -788,7 +788,23 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   for (const peer of state.config.peers) {
     if (peerHost(peer) === hostname) continue;
-    adapters.push(new WebSocketClientAdapter(`ws://${peer}`));
+    const adapter = new WebSocketClientAdapter(`ws://${peer}`);
+    // Upstream bug: onError throws non-ECONNREFUSED errors (ETIMEDOUT,
+    // ENOTFOUND, etc.) and disconnect() throws when the socket never
+    // opened. Both become uncaught exceptions that pi's own handler
+    // (process.prependListener) catches first and calls process.exit(1).
+    // Wrap the instance methods to swallow these errors at the source.
+    const origOnError = adapter.onError;
+    adapter.onError = ((event: any) => {
+      try { origOnError.call(adapter, event); }
+      catch (err: any) { console.error(`[pi-sync] Connection error to ${peer}: ${err?.message ?? err}`); }
+    }) as typeof adapter.onError;
+    const origDisconnect = adapter.disconnect;
+    adapter.disconnect = () => {
+      try { origDisconnect.call(adapter); }
+      catch (err: any) { console.error(`[pi-sync] Disconnect error for ${peer}: ${err?.message ?? err}`); }
+    };
+    adapters.push(adapter);
   }
   // Snapshot for the "edited since last reload" hint in /sync:status.
   state.peersAtInit = [...state.config.peers];
