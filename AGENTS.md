@@ -4,16 +4,27 @@ pi-sync is a P2P sync extension for the pi coding agent. It uses Automerge CRDTs
 WebSocket (typically Tailscale) to keep pi settings, extensions, skills, models, and
 prompts in sync across machines.
 
+For the canonical protocol reference, identity model, and trust assumptions, see
+**[PROTOCOL.md](./PROTOCOL.md)**.
+
 ## Project layout
 
 ```
 extensions/pi-sync/
+├── PROTOCOL.md       # Canonical protocol & architecture reference
+├── AGENTS.md         # This file — AI-facing rules and conventions
+├── README.md         # User-facing install and quick-start docs
 ├── index.ts          # Extension entry point — commands, repo lifecycle, watchers
 ├── lib.ts            # Pure functions & types, testable without Automerge/WASM
 ├── lib.test.ts       # Unit tests for lib.ts (vitest)
+├── state.ts          # Shared state singleton (hostname, config, runtime handles)
 ├── types.ts          # TypeScript interfaces (re-export / documentation)
+├── footer.ts         # TUI footer widget (sync status line)
 ├── package.json      # Dependencies: @automerge/*, ws, vitest
-└── README.md         # User-facing docs
+├── ws-patch.test.ts  # Tests for ws/net socket monkey-patches
+├── reconnect-patch.test.ts  # Tests for WebSocket reconnect handling
+├── zensical.toml     # Documentation site config
+└── docs/             # User-facing documentation (zensical site)
 ```
 
 ## Key rules
