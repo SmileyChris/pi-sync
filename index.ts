@@ -40,6 +40,17 @@ function debugLog(msg: string) {
   const line = `[${ts}] ${msg}\n`;
   try { fs.appendFileSync(DEBUG_LOG, line); } catch {}
 }
+
+/** Log to debug file AND show a TUI notification if a session is active.
+ *  Prefer this over console.log so the message participates in the TUI
+ *  layout rather than landing on stdout and displacing the editor. */
+function notifyActive(
+  message: string,
+  type: "info" | "warning" | "error" = "info",
+) {
+  debugLog(message);
+  try { state.activeUi?.notify(message, type); } catch {}
+}
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -194,7 +205,7 @@ function startProbing() {
   if (state.probeInterval) return;
   const runProbe = () => {
     void probeAllPeers().catch((e: any) =>
-      console.error("[pi-sync] Peer probe failed:", e?.message ?? e),
+      debugLog(`Peer probe failed: ${e?.message ?? e}`),
     );
   };
   runProbe(); // immediate first probe
@@ -473,16 +484,19 @@ async function installMissingExtensionDeps(): Promise<void> {
           if (fs.existsSync(nmDir)) continue;
           const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
           if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) continue;
-          console.log(`[pi-sync] Installing deps for ${extName}…`);
+          debugLog(`Installing deps for ${extName}…`);
+          state.activeUi?.setStatus("pi-sync-install", `Installing deps for ${extName}…`);
           await execAsync("npm install --ignore-scripts", {
             cwd: extDir,
             timeout: 60_000,
           });
-          console.log(`[pi-sync] Dependencies installed for ${extName}`);
+          state.activeUi?.setStatus("pi-sync-install", undefined);
+          notifyActive(`Dependencies installed for ${extName}`, "info");
         } catch (err: any) {
-          console.error(
-            `[pi-sync] Failed to install deps for ${extName}:`,
-            err?.message ?? err,
+          state.activeUi?.setStatus("pi-sync-install", undefined);
+          notifyActive(
+            `Failed to install deps for ${extName}: ${err?.message ?? err}`,
+            "error",
           );
         }
       }
@@ -510,7 +524,7 @@ function exportKeys(doc: PiConfigDocument, keys: Iterable<string>): boolean {
 
 function exportAllFiles(doc: PiConfigDocument): boolean {
   if (isDocEmpty(doc)) {
-    console.log("[pi-sync] Skipping export: document appears empty (first sync?)");
+    debugLog("Skipping export: document appears empty (first sync?)");
     return false;
   }
   return exportKeys(doc, [
@@ -548,11 +562,11 @@ async function flushPendingChanges() {
     // The user likely ran `rm -rf` / `git clean` / similar — better to
     // require them to restore the files and make a smaller deliberate
     // delete than silently wipe the cluster.
-    console.error(
-      `[pi-sync] Mass-delete brake: ${deletions.length} files vanished in one flush ` +
+    const msg =
+      `Mass-delete brake: ${deletions.length} files vanished in one flush ` +
       `(limit ${MASS_DELETE_LIMIT}). No tombstones were created for those missing files. ` +
-      `Restore them on disk, or restore and remove a smaller deliberate batch to propagate deletes.`,
-    );
+      `Restore them on disk, or restore and remove a smaller deliberate batch to propagate deletes.`;
+    notifyActive(msg, "warning");
   }
 
   withSuppressedExport(() => {
@@ -561,7 +575,7 @@ async function flushPendingChanges() {
         try {
           importFile(doc, key);
         } catch (err: any) {
-          console.error(`[pi-sync] importFile failed for ${key}:`, err?.message ?? err);
+          debugLog(`importFile failed for ${key}: ${err?.message ?? err}`);
         }
       }
       if (blockedDeletions) return;
@@ -616,7 +630,7 @@ function startFileWatcher() {
       state.watchTimer = setTimeout(flushPendingChanges, WATCH_DEBOUNCE_MS);
     });
   } catch (err) {
-    console.error("[pi-sync] fs.watch failed:", err);
+    debugLog(`fs.watch failed: ${err}`);
   }
 }
 
@@ -650,7 +664,7 @@ async function purgePastTTL(): Promise<number> {
     }
   });
   for (const p of purgeable) purgeFromTrash(p.key);
-  console.log(`[pi-sync] Purged ${purgeable.length} tombstone(s) past TTL`);
+  debugLog(`Purged ${purgeable.length} tombstone(s) past TTL`);
   return purgeable.length;
 }
 
@@ -689,7 +703,7 @@ function quarantineStorage(): string | null {
     fs.renameSync(AM_STORAGE, dest);
     return dest;
   } catch (e: any) {
-    console.error("[pi-sync] Failed to quarantine storage:", e?.message ?? e);
+    debugLog(`Failed to quarantine storage: ${e?.message ?? e}`);
     return null;
   }
 }
@@ -710,7 +724,7 @@ function stubProcessExit() {
   const origExit = process.exit;
   (process.exit as any) = ((code?: number) => {
     if ((process.exit as any)._stubbed) {
-      console.error(`[pi-sync] Suppressed process.exit(${code})`);
+      debugLog(`Suppressed process.exit(${code})`);
       return undefined as never;
     }
     return origExit(code);
@@ -745,7 +759,7 @@ function installCrashGuard() {
     // handler (which fires after ours) from calling process.exit(1).
     if (isNetworkError(err) || /WebSocket was closed before/.test(msg)) {
       debugLog(`crash-guard: recognized as recoverable, stubbing process.exit`);
-      console.error(`[pi-sync] ${kind}: ${msg} (not fatal)`);
+      debugLog(`${kind}: ${msg} (not fatal)`);
       stubProcessExit();
       return;
     }
@@ -754,11 +768,11 @@ function installCrashGuard() {
       // Unknown error: let pi decide whether to crash. We don't stub
       // process.exit here — non-Automerge, non-network errors should
       // still surface to the user.
-      console.error(`[pi-sync] uncaught ${kind}:`, err);
+      debugLog(`uncaught ${kind}: ${String(err)}`);
       return;
     }
 
-    console.error(`[pi-sync] Automerge ${kind} caught:`, msg);
+    debugLog(`Automerge ${kind} caught: ${msg}`);
     const dest = quarantineStorage();
     void shutdownRepo().catch(() => {});
     stubProcessExit();
@@ -875,12 +889,13 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
   state.wss.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
-      console.error(
-        `[pi-sync] Port ${state.config.port} is in use. ` +
-        `Edit ~/.config/pi-sync/config.json to change.`
+      notifyActive(
+        `Port ${state.config.port} is in use. ` +
+        `Edit ~/.config/pi-sync/config.json to change.`,
+        "error",
       );
     } else {
-      console.error("[pi-sync] WS server error:", err.message);
+      debugLog(`WS server error: ${err.message}`);
     }
   });
 
@@ -916,7 +931,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       try { origOnError.call(adapter, event); }
       catch (err: any) {
         debugLog(`onError-wrapped: CAUGHT throw for ${peer}: ${err?.message ?? err}`);
-        console.error(`[pi-sync] Connection error to ${peer}: ${err?.message ?? err}`);
+        debugLog(`Connection error to ${peer}: ${err?.message ?? err}`);
       }
     }) as typeof adapter.onError;
     const origDisconnect = adapter.disconnect;
@@ -925,7 +940,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       try { origDisconnect.call(adapter); }
       catch (err: any) {
         debugLog(`disconnect-wrapped: CAUGHT for ${peer}: ${err?.message ?? err}`);
-        console.error(`[pi-sync] Disconnect error for ${peer}: ${err?.message ?? err}`);
+        debugLog(`Disconnect error for ${peer}: ${err?.message ?? err}`);
       }
       debugLog(`disconnect-wrapped: completed for ${peer}`);
     };
@@ -976,7 +991,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
         importFile(doc, fileKey);
       });
     }
-    console.log(`[pi-sync] Imported ${files.length} files into new document`);
+    notifyActive(`Imported ${files.length} files into new sync document`, "info");
   }
 
   // Attach the change listener BEFORE awaiting whenReady so we don't miss
@@ -1019,7 +1034,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   try {
     await state.handle.whenReady?.();
   } catch (err: any) {
-    console.error("[pi-sync] handle never became ready:", err?.message ?? err);
+    notifyActive(`Sync document never became ready: ${err?.message ?? err}`, "error");
     return;
   }
 
@@ -1109,7 +1124,7 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   const port = normalizeProbePort(state.config.port);
   if (port == null) {
     state.standbyMode = false;
-    console.error(`[pi-sync] Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`);
+    notifyActive(`Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`, "error");
     return;
   }
   const waitResult = await waitForLocalSyncSocketClose(port);
@@ -1123,17 +1138,18 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
   if (!(await canBindLocalPort(port))) {
     if (waitResult === "unreachable") {
       state.standbyMode = false;
-      console.error(
-        `[pi-sync] Port ${port} is in use, but no pi-sync WebSocket responded. ` +
+      notifyActive(
+        `Port ${port} is in use, but no pi-sync WebSocket responded. ` +
         `Edit ~/.config/pi-sync/config.json to change.`,
+        "error",
       );
       return;
     }
-    console.log(
-      `[pi-sync] Another instance took port ${state.config.port} — resuming standby`,
+    debugLog(
+      `Another instance took port ${state.config.port} — resuming standby`,
     );
     watchAndTakeOver(pi).catch((e: any) =>
-      console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+      debugLog(`Watchdog failed: ${e?.message ?? e}`),
     );
     return;
   }
@@ -1765,7 +1781,7 @@ function startSyncInBackground(pi: ExtensionAPI) {
     try {
       const port = normalizeProbePort(state.config.port);
       if (port == null) {
-        console.error(`[pi-sync] Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`);
+        notifyActive(`Invalid port ${state.config.port}. Edit ~/.config/pi-sync/config.json to change.`, "error");
         return;
       }
 
@@ -1777,7 +1793,7 @@ function startSyncInBackground(pi: ExtensionAPI) {
         // so the guard takes over from initInProgress as soon as the .catch
         // below returns.
         watchAndTakeOver(pi).catch((e: any) =>
-          console.error("[pi-sync] Watchdog failed:", e?.message ?? e),
+          debugLog(`Watchdog failed: ${e?.message ?? e}`),
         );
       } else {
         await initRepo(pi);
@@ -1786,7 +1802,7 @@ function startSyncInBackground(pi: ExtensionAPI) {
         startProbing();
       }
     } catch (e: any) {
-      console.error("[pi-sync] Failed to initialize sync repo:", e?.message ?? e);
+      notifyActive(`Failed to initialize sync repo: ${e?.message ?? e}`, "error");
     } finally {
       state.initInProgress = false;
     }
