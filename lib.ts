@@ -469,6 +469,7 @@ export function dirtyKeysFromPatches(patches: ReadonlyArray<PatchLike>): Set<str
       section === "extensions" ||
       section === "skills" ||
       section === "prompts" ||
+      section === "sessions" ||
       section === "localOnly"
     ) {
       const key = p.path[1];

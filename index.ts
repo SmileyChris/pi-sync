@@ -397,7 +397,8 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
     return applyJsonMergeInPlace(doc[subdir], content);
   }
 
-  // extensions | skills | prompts
+  // extensions | skills | prompts | sessions
+  if (!doc[subdir]) (doc as Record<string, unknown>)[subdir] = {};
   const collection = doc[subdir] as Record<string, SyncedFile>;
   const existing = collection[key];
   if (syncedFileContentMatches(existing, content)) return false;
@@ -477,6 +478,7 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
     return true;
   }
 
+  if (!doc[subdir]) return false;
   const collection = doc[subdir] as Record<string, SyncedFile>;
   const synced = collection[fileKey] ?? collection[key];
   if (!synced) return false;
