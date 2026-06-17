@@ -62,6 +62,8 @@ export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 export const DOC_URL_PATH = path.join(CONFIG_DIR, "doc-url");
 export const AM_STORAGE = path.join(home, ".pi", "am-storage");
 export const TRASH_DIR = path.join(PI_DIR, ".trash");
+export const STATE_DIR = path.join(home, ".local", "state", "pi-sync");
+export const DEBUG_LOG = path.join(STATE_DIR, "debug.log");
 
 // ── Tombstone config ─────────────────────────────────────────────────
 

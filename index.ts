@@ -34,23 +34,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 // ── Debug logging ────────────────────────────────────────────────────
-const DEBUG_LOG = "/tmp/pi-sync-debug.log";
-function debugLog(msg: string) {
-  const ts = new Date().toISOString();
-  const line = `[${ts}] ${msg}\n`;
-  try { fs.appendFileSync(DEBUG_LOG, line); } catch {}
-}
-
-/** Log to debug file AND show a TUI notification if a session is active.
- *  Prefer this over console.log so the message participates in the TUI
- *  layout rather than landing on stdout and displacing the editor. */
-function notifyActive(
-  message: string,
-  type: "info" | "warning" | "error" = "info",
-) {
-  debugLog(message);
-  try { state.activeUi?.notify(message, type); } catch {}
-}
 import {
   type SyncedFile,
   type PiConfigDocument,
@@ -62,6 +45,8 @@ import {
   DOC_URL_PATH,
   AM_STORAGE,
   TRASH_DIR,
+  STATE_DIR,
+  DEBUG_LOG,
   TOMBSTONE_TTL_MS,
   MASS_DELETE_LIMIT,
   normalizeFileKey,
@@ -84,6 +69,26 @@ import {
   isPastTTL,
   partitionPendingChanges,
 } from "./lib";
+
+function debugLog(msg: string) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}\n`;
+  try {
+    ensureDir(STATE_DIR);
+    fs.appendFileSync(DEBUG_LOG, line);
+  } catch {}
+}
+
+/** Log to debug file AND show a TUI notification if a session is active.
+ *  Prefer this over console.log so the message participates in the TUI
+ *  layout rather than landing on stdout and displacing the editor. */
+function notifyActive(
+  message: string,
+  type: "info" | "warning" | "error" = "info",
+) {
+  debugLog(message);
+  try { state.activeUi?.notify(message, type); } catch {}
+}
 
 export type { SyncedFile, PiConfigDocument, SyncConfig };
 
@@ -1233,9 +1238,13 @@ export default function (pi: ExtensionAPI) {
       ];
 
       // Recent remote changes
-      if (state.recentRemoteChanges.length > 0 && Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS) {
-        const ago = Math.round((Date.now() - state.lastRemoteChangeTime) / 1000);
-        const agoStr = ago < 10 ? "just now" : `${ago}s ago`;
+      if (state.recentRemoteChanges.length > 0) {
+        const agoMs = Date.now() - state.lastRemoteChangeTime;
+        const agoStr = agoMs < 60_000
+          ? `${Math.round(agoMs / 1000)}s ago`
+          : agoMs < 3_600_000
+            ? `${Math.round(agoMs / 60_000)}m ago`
+            : `${Math.round(agoMs / 3_600_000)}h ago`;
         lines.push(``);
         lines.push(`🔄 Last sync (${agoStr}) — ${state.recentRemoteChanges.length} change(s):`);
         for (const k of state.recentRemoteChanges.slice(0, 15)) {
