@@ -44,6 +44,15 @@
 - **Default:** `true`
 - **Description:** Sync `~/.pi/agent/prompts/**/*.md` and `**/*.txt`.
 
+## `syncSessions`
+
+- **Type:** boolean
+- **Default:** `true`
+- **Description:** Sync `~/.pi/agent/sessions/**/*.jsonl` (session history).
+Files are keyed by source hostname so remote sessions land under
+`sessions/{hostname}/` — clearly distinguishable from local sessions
+and automatically indexed by pi-session-search.
+
 ## Other files in `~/.config/pi-sync/`
 
 | File | Purpose |

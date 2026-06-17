@@ -4,12 +4,28 @@ Keep your pi coding agent setup in sync across your own machines.
 
 `pi-sync` is a local-first, peer-to-peer sync extension for pi. It shares the
 parts of your setup that are useful to keep consistent, such as settings,
-models, prompts, skills, and extensions, while leaving machine-specific files
-like auth, sessions, caches, and peer config alone.
+models, prompts, skills, extensions, and session history, while leaving
+machine-specific files like auth, caches, and peer config alone.
 
-It uses Automerge CRDTs over WebSocket, so peers can edit independently and
-merge when they reconnect. The usual setup is to run it across machines on the
-same Tailscale tailnet, with no central server required.
+It uses Automerge CRDTs over WebSocket in a full-mesh topology — every peer
+connects to every other. Peers can edit independently and merge when they
+reconnect. No central server, no primary node. Typically run across machines
+on the same Tailscale tailnet.
+
+### What syncs
+
+| Category    | Path                                  |
+|------------|---------------------------------------|
+| settings   | `~/.pi/agent/settings.json`           |
+| models     | `~/.pi/agent/models.json`             |
+| extensions | `~/.pi/agent/extensions/`             |
+| skills     | `~/.pi/agent/skills/`                 |
+| prompts    | `~/.pi/agent/prompts/`                |
+| sessions   | `~/.pi/agent/sessions/` (`.jsonl` only) |
+
+Session files are keyed by source hostname so remote sessions land under
+`sessions/{hostname}/` on every peer — clearly distinguishable from local
+sessions and automatically indexed by pi-session-search.
 
 ## Install
 

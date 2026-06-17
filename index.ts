@@ -1,11 +1,18 @@
 /**
- * pi-sync — P2P sync for pi coding agent settings
+ * pi-sync — P2P sync for pi coding agent config & session history
  *
- * Uses Automerge CRDTs to sync pi configuration (settings, extensions,
- * skills, models, prompts) across machines via WebSocket over Tailscale.
- * No central server required — each peer runs a lightweight WS server
- * and connects to every other peer. Works offline and merges
- * automatically when reconnected.
+ * Syncs six categories of files under ~/.pi/agent/ via Automerge CRDTs:
+ * settings, models, extensions, skills, prompts, and sessions.
+ * Full-mesh topology over WebSocket — every peer connects to every
+ * other peer listed in ~/.config/pi-sync/config.json. No hub, no
+ * primary. Works offline and merges automatically when reconnected.
+ *
+ * Session files are keyed as sessions/{source-hostname}/{cwd-dir}/…
+ * so remote sessions land under a hostname directory on every peer,
+ * clearly distinguishable from local sessions. pi-session-search
+ * indexes them automatically via recursive .jsonl discovery.
+ *
+ * Debug log: ~/.local/state/pi-sync/debug.log
  *
  * Dependencies are loaded dynamically to avoid jiti/WASM import issues.
  *

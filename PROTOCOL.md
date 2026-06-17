@@ -8,8 +8,8 @@ Last updated: 2026-06-17.
 ## Overview
 
 pi-sync keeps your pi coding agent setup — settings, models, extensions, skills,
-and prompts — in sync across your own machines. It's a local-first, P2P sync
-extension backed by Automerge CRDTs.
+prompts, and session history — in sync across your own machines. It's a
+local-first, P2P sync extension backed by Automerge CRDTs.
 
 - **No central server.** Every peer runs a lightweight WebSocket server and
   dials outbound to every other peer.
@@ -64,6 +64,7 @@ interface PiConfigDocument {
   extensions: Record<string, SyncedFile>;    // extension files by key
   skills: Record<string, SyncedFile>;        // skill markdown files by key
   prompts: Record<string, SyncedFile>;       // prompt markdown/txt files by key
+  sessions: Record<string, SyncedFile>;      // session .jsonl files by key
   localOnly: Record<string, string[]>;       // fileKey → allowed hosts
   lastSync: Record<string, number>;          // hostname → epoch ms
 }
@@ -92,7 +93,15 @@ extensions/<name>/index.ts     → extensions
 extensions/<name>/package.json → extensions
 skills/<name>/SKILL.md         → skills
 prompts/<name>.md              → prompts
+sessions/<host>/<cwd>/*.jsonl  → sessions
 ```
+
+Session keys include the source hostname — e.g.,
+`sessions/macbook/--Users-chris--/2026-06-01.jsonl` — so remote sessions
+land in a hostname directory on every peer, clearly distinguishable from
+local sessions. The local-export guard skips sessions whose original source
+file (under the `--...--` CWD directory) still exists, preventing duplicate
+copies of our own sessions on disk.
 
 The subdirectory prefix determines the section of the document the file maps to.
 `settings.json` and `models.json` are per-key merged into their respective
@@ -358,7 +367,7 @@ multiple concurrent pi sessions.
 - **Cluster liveness.** Crash guard, network error suppression, and standby
   watchdog keep the sync layer alive despite Automerge panics and peer churn.
 - **Machine isolation.** Local-only entries keep machine-specific files
-  (auth, caches, sessions) from leaking to peers.
+  (auth, caches) from leaking to peers.
 
 ### What pi-sync does NOT protect (declared honestly)
 
@@ -416,7 +425,8 @@ multiple concurrent pi sessions.
   "syncModels": true,
   "syncExtensions": true,
   "syncSkills": true,
-  "syncPrompts": true
+  "syncPrompts": true,
+  "syncSessions": true
 }
 ```
 

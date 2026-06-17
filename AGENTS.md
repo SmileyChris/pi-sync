@@ -1,8 +1,8 @@
 # AGENTS.md — pi-sync
 
 pi-sync is a P2P sync extension for the pi coding agent. It uses Automerge CRDTs over
-WebSocket (typically Tailscale) to keep pi settings, extensions, skills, models, and
-prompts in sync across machines.
+WebSocket (typically Tailscale) to keep pi settings, extensions, skills, models,
+prompts, and session history in sync across machines.
 
 For the canonical protocol reference, identity model, and trust assumptions, see
 **[PROTOCOL.md](./PROTOCOL.md)**.

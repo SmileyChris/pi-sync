@@ -36,7 +36,7 @@ Auto-discover pi-sync peers on the tailnet. Requires the `tailscale` CLI.
 
 ## `/sync:config`
 
-Open an interactive panel to toggle sync categories (`syncSettings`, `syncModels`, `syncExtensions`, `syncSkills`, `syncPrompts`).
+Open an interactive panel to toggle sync categories (`syncSettings`, `syncModels`, `syncExtensions`, `syncSkills`, `syncPrompts`, `syncSessions`).
 
 ## `/sync:local-only list`
 

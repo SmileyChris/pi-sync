@@ -12,7 +12,8 @@ pi-sync reads `~/.config/pi-sync/config.json`. All fields are optional; defaults
   "syncModels": true,        // Sync models.json
   "syncExtensions": true,    // Sync extension code
   "syncSkills": true,        // Sync skill SKILL.md files
-  "syncPrompts": true        // Sync prompt files
+  "syncPrompts": true,       // Sync prompt files
+  "syncSessions": true       // Sync session history (.jsonl)
 }
 ```
 
