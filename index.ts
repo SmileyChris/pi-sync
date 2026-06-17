@@ -63,6 +63,8 @@ import {
   collectExtensionFiles,
   collectSkillFiles,
   collectPromptFiles,
+  collectSessionFiles,
+  SESSIONS_DIR,
   dirtyKeysFromPatches,
   isDocEmpty,
   isTombstone,
@@ -273,6 +275,19 @@ function piPathForKey(fileKey: string): string | null {
   return pathForFileKey(PI_DIR, fileKey);
 }
 
+/** Map a session doc key to the local filesystem path for import.
+ *  Keys are sessions/{source-hostname}/{rest} but local files live at
+ *  sessions/{rest} (without the hostname prefix). For our own hostname
+ *  we strip the prefix; for remote hostnames the file was already
+ *  written to the key path by a previous export. */
+function sessionImportPath(key: string): string | null {
+  const ourPrefix = `sessions/${hostname}/`;
+  if (key.startsWith(ourPrefix)) {
+    return piPathForKey(`sessions/${key.slice(ourPrefix.length)}`);
+  }
+  return piPathForKey(key);
+}
+
 function trashPathForKey(fileKey: string): string | null {
   return pathForFileKey(TRASH_DIR, fileKey);
 }
@@ -350,7 +365,9 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
   if (!shouldSync(key, state.config)) return false;
   if (isLocalOnly(doc, key, hostname)) return false;
 
-  const absPath = piPathForKey(key);
+  const absPath = subdir === "sessions"
+    ? sessionImportPath(key)
+    : piPathForKey(key);
   if (!absPath) return false;
   // Stat instead of existsSync so we skip directories — fs.watch fires for
   // mkdir/rmdir too, and readFileSync on a dir throws EISDIR.
@@ -402,6 +419,9 @@ function collectAllFiles(): string[] {
   if (state.config.syncPrompts && fs.existsSync(promptsDir)) {
     files.push(...collectPromptFiles(promptsDir, readEntries));
   }
+  if (state.config.syncSessions && fs.existsSync(SESSIONS_DIR)) {
+    files.push(...collectSessionFiles(SESSIONS_DIR, hostname, readEntries));
+  }
 
   return files;
 }
@@ -426,6 +446,16 @@ function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
 
   const absPath = piPathForKey(key);
   if (!absPath) return false;
+
+  // Sessions: if the original source file (under --...-- dir) still
+  // exists locally, skip export — this is our own session and it
+  // already lives at its native path. Only export sessions that do
+  // NOT have a local source (i.e. remote sessions from other peers).
+  if (subdir === "sessions") {
+    const sourcePath = sessionImportPath(key);
+    if (sourcePath && sourcePath !== absPath && fs.existsSync(sourcePath))
+      return false;
+  }
 
   if (subdir === "settings" || subdir === "models") {
     const content = JSON.stringify(doc[subdir], null, 2) + "\n";
@@ -1231,9 +1261,9 @@ export default function (pi: ExtensionAPI) {
         ),
         ...(peersDivergedFromInit() ? [`  _peer list edited since last reload — run \`/reload\` to apply_`] : []),
         ``,
-        `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts`,
+        `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts  ${onOff(state.config.syncSessions)} sessions`,
         ``,
-        `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts`,
+        `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts  📜 ${Object.keys(doc?.sessions ?? {}).length} sessions`,
         `Local-only: \`${Object.keys(doc?.localOnly ?? {}).length}\` entries`,
       ];
 

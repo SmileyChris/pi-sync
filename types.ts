@@ -20,6 +20,7 @@ export interface PiConfigDocument {
   extensions: Record<string, SyncedFile>;
   skills: Record<string, SyncedFile>;
   prompts: Record<string, SyncedFile>;
+  sessions: Record<string, SyncedFile>;
   localOnly: Record<string, string[]>;
   lastSync: Record<string, number>;
 }
@@ -32,4 +33,5 @@ export interface SyncConfig {
   syncSkills: boolean;
   syncModels: boolean;
   syncPrompts: boolean;
+  syncSessions: boolean;
 }

@@ -39,9 +39,10 @@ export interface SyncConfig {
   syncSkills: boolean;
   syncModels: boolean;
   syncPrompts: boolean;
+  syncSessions: boolean;
 }
 
-export type Subdir = "settings" | "models" | "extensions" | "skills" | "prompts";
+export type Subdir = "settings" | "models" | "extensions" | "skills" | "prompts" | "sessions";
 
 export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   port: 3030,
@@ -51,6 +52,7 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   syncSkills: true,
   syncModels: true,
   syncPrompts: true,
+  syncSessions: true,
 };
 
 // ── Path constants ───────────────────────────────────────────────────
@@ -64,6 +66,7 @@ export const AM_STORAGE = path.join(home, ".pi", "am-storage");
 export const TRASH_DIR = path.join(PI_DIR, ".trash");
 export const STATE_DIR = path.join(home, ".local", "state", "pi-sync");
 export const DEBUG_LOG = path.join(STATE_DIR, "debug.log");
+export const SESSIONS_DIR = path.join(PI_DIR, "sessions");
 
 // ── Tombstone config ─────────────────────────────────────────────────
 
@@ -108,6 +111,8 @@ export function getSubdir(fileKey: string): Subdir | null {
     return "skills";
   if (key.startsWith("prompts/"))
     return "prompts";
+  if (key.startsWith("sessions/"))
+    return "sessions";
   return null;
 }
 
@@ -139,6 +144,7 @@ export function isSupportedFileKey(fileKey: string): boolean {
   if (subdir === "extensions") return !isPiSyncExtensionKey(key) && hasAllowedSuffix(key, EXTENSION_EXTS);
   if (subdir === "skills") return hasAllowedSuffix(key, SKILL_EXTS);
   if (subdir === "prompts") return hasAllowedSuffix(key, PROMPT_EXTS);
+  if (subdir === "sessions") return hasAllowedSuffix(key, SESSION_EXTS);
   return false;
 }
 
@@ -184,6 +190,7 @@ const SUBDIR_TO_TOGGLE: Record<Subdir, keyof SyncConfig> = {
   extensions: "syncExtensions",
   skills: "syncSkills",
   prompts: "syncPrompts",
+  sessions: "syncSessions",
 };
 
 export function shouldSync(fileKey: string, config: SyncConfig): boolean {
@@ -269,6 +276,58 @@ export function collectPromptFiles(
     { skipDirs: new Set(["node_modules"]), exts: PROMPT_EXTS },
     readdirSync,
   );
+}
+
+const SESSION_EXTS = [".jsonl"] as const;
+
+export function collectSessionFiles(
+  sessionsDir: string,
+  hostname: string,
+  readdirSync: (dir: string) => fsDirEntry[],
+): string[] {
+  // Walk sessions/ but only collect files under --...-- dirs (pi's
+  // CWD-derived session directories). Skip loose hostname directories
+  // that contain synced sessions to avoid re-syncing.
+  // Keys are sessions/{hostname}/{rel} so remote sessions land in
+  // their own hostname directory on every peer.
+  const results: string[] = [];
+  let entries: fsDirEntry[];
+  try {
+    entries = readdirSync(sessionsDir);
+  } catch {
+    return results;
+  }
+  const prefix = `sessions/${hostname}/`;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (!entry.name.startsWith("--")) continue;
+    walkSessionDir(path.join(sessionsDir, entry.name), entry.name, readdirSync, results, prefix);
+  }
+  return results;
+}
+
+function walkSessionDir(
+  dir: string,
+  relPrefix: string,
+  readdirSync: (dir: string) => fsDirEntry[],
+  out: string[],
+  keyPrefix: string,
+) {
+  let entries: fsDirEntry[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    const rel = `${relPrefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      walkSessionDir(full, rel, readdirSync, out, keyPrefix);
+    } else if (entry.name.endsWith(".jsonl") && entry.name !== "pins.json" && entry.name !== "active-sessions.json") {
+      out.push(keyPrefix + rel);
+    }
+  }
 }
 
 // ── Import helpers ───────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import {
   collectExtensionFiles,
   collectSkillFiles,
   collectPromptFiles,
+  collectSessionFiles,
   dirtyKeysFromPatches,
   isDocEmpty,
   isTombstone,
@@ -138,6 +139,7 @@ describe("getSubdir", () => {
     ["extensions\\foo\\index.ts", "extensions"], // windows
     ["skills/my-skill/SKILL.md", "skills"],
     ["prompts/custom.md", "prompts"],
+    ["sessions/foo.jsonl", "sessions"],
   ])("maps %s → %s", (key, expected) => {
     expect(getSubdir(key)).toBe(expected);
   });
@@ -146,7 +148,6 @@ describe("getSubdir", () => {
     ["unknown/file.txt"],
     [""],
     ["auth.json"],
-    ["sessions/foo.json"],
     ["extensions-foo.md"], // name-similar to a subdir but not under it
     ["extensions/../settings.json"],
     ["/extensions/foo/index.ts"],
@@ -236,6 +237,7 @@ describe("shouldSync", () => {
     syncExtensions: false,
     syncSkills: false,
     syncPrompts: false,
+    syncSessions: false,
   };
 
   it.each([
@@ -244,6 +246,7 @@ describe("shouldSync", () => {
     ["extensions/foo/index.ts", "syncExtensions"],
     ["skills/foo/SKILL.md", "syncSkills"],
     ["prompts/foo.md", "syncPrompts"],
+    ["sessions/foo.jsonl", "syncSessions"],
   ] as const)("respects %s toggle via %s", (key, toggle) => {
     expect(shouldSync(key, DEFAULT_SYNC_CONFIG)).toBe(true);
     expect(shouldSync(key, allOff)).toBe(false);
@@ -952,5 +955,50 @@ describe("partitionPendingChanges", () => {
     );
     expect(out.present).toEqual([]);
     expect(out.deletions).toEqual([]);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+//  collectSessionFiles
+// ══════════════════════════════════════════════════════════════════════
+
+describe("collectSessionFiles", () => {
+  const hostname = "test-host";
+
+  it("returns empty for non-existent dir", () => {
+    const noDir = () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); };
+    expect(collectSessionFiles("/nonexistent", hostname, noDir)).toEqual([]);
+  });
+
+  it("collects .jsonl files under --...-- dirs and maps keys", () => {
+    const readdir = makeFS("/fake/sessions", {
+      "--home-chris--": {
+        "2026-01-01T00-00.jsonl": null,
+        "2026-01-02T00-00.jsonl": null,
+        "notes.txt": null,
+        nested: {
+          "deep.jsonl": null,
+        },
+      },
+      "--home-chris-dev--": {
+        "2026-06-01T00-00.jsonl": null,
+      },
+      "some-host-dir": {},
+      "orphan.jsonl": null,
+      "random.txt": null,
+    });
+
+    const result = collectSessionFiles("/fake/sessions", hostname, readdir);
+
+    expect(result).toContain(`sessions/${hostname}/--home-chris--/2026-01-01T00-00.jsonl`);
+    expect(result).toContain(`sessions/${hostname}/--home-chris--/2026-01-02T00-00.jsonl`);
+    expect(result).toContain(`sessions/${hostname}/--home-chris--/nested/deep.jsonl`);
+    expect(result).toContain(`sessions/${hostname}/--home-chris-dev--/2026-06-01T00-00.jsonl`);
+    // Non --...-- dirs are skipped
+    expect(result).not.toContain(expect.stringContaining("some-host-dir"));
+    // Non-.jsonl files are skipped
+    expect(result).not.toContain("notes.txt");
+    // Top-level orphan .jsonl (not under --...-- dir) is skipped
+    expect(result).not.toContain("orphan.jsonl");
   });
 });
