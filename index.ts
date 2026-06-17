@@ -77,7 +77,10 @@ import {
   isTombstone,
   isPastTTL,
   partitionPendingChanges,
+  effectivePeers,
+  computeMeshPeerHosts,
 } from "./lib";
+import type { KnownPeer } from "./lib";
 
 function debugLog(msg: string) {
   const ts = new Date().toISOString();
@@ -949,16 +952,35 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     }
   });
 
-  // Track real WS connections (inbound = another peer connected to us)
-  state.wss.on("connection", (ws: any, req: any) => {
-    // Prevent ECONNRESET/EPIPE uncaught crashes on incoming client connections
-    ws.on("error", () => {});
-
-    const remoteAddr = req.socket?.remoteAddress || "unknown";
-    const host = remoteAddr.replace(/^::ffff:/, "");
+  // Track connections via Automerge adapter events (not raw TCP) so we
+  // capture both inbound and outbound peers under their real hostnames.
+  // Also buffer peers that connect before the doc is ready — we flush
+  // them into doc.knownPeers after whenReady resolves.
+  const preReadyPeers = new Set<string>();
+  const trackPeer = (peerId: PeerId) => {
+    const host = (peerId as string).replace(/^pi-sync-/, "");
+    debugLog(`peer-candidate: ${host}`);
     state.wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
-    ws.on("close", () => state.wsConnectedPeers.delete(host));
-  });
+    // Add to meshPeerHosts synchronously so the footer updates immediately.
+    // The change listener will recompute the full set when the doc write lands.
+    state.meshPeerHosts.add(host);
+    // Write to doc's knownPeers roster (shared mesh directory)
+    if (state.handle) {
+      state.handle.change?.((doc: PiConfigDocument) => {
+        doc.knownPeers[host] = {
+          lastSeen: Date.now(),
+          addedBy: hostname,
+        };
+      });
+    } else {
+      preReadyPeers.add(host);
+    }
+  };
+  const untrackPeer = (peerId: PeerId) => {
+    const host = (peerId as string).replace(/^pi-sync-/, "");
+    debugLog(`peer-disconnected: ${host}`);
+    state.wsConnectedPeers.delete(host);
+  };
 
   // ── Network adapters ──────────────────────────────────────────────
 
@@ -994,8 +1016,15 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       }
       debugLog(`disconnect-wrapped: completed for ${peer}`);
     };
+    // Track outbound connection state via adapter events
+    adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
+    adapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
     adapters.push(adapter);
   }
+  // Track inbound connections via server adapter events
+  serverAdapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
+  serverAdapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
+
   // Snapshot for the "edited since last reload" hint in /sync:status.
   state.peersAtInit = [...state.config.peers];
 
@@ -1025,6 +1054,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       extensions: {},
       skills: {},
       prompts: {},
+      knownPeers: {},
       localOnly: {
         // pi-sync extension must stay local — WASM binaries and peer
         // config are platform/machine-specific.
@@ -1054,6 +1084,11 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     if (state.suppressExportDepth > 0) return;
     if (isDocEmpty(doc)) return;
     const patches: any[] = payload?.patches ?? [];
+
+    // If knownPeers changed, refresh the mesh roster cache
+    if (patches.length === 0 || patches.some((p: any) => p.path[0] === "knownPeers")) {
+      state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, doc.knownPeers, hostname);
+    }
 
     // Track remote changes for the footer widget and /sync:status
     state.lastRemoteChangeTime = Date.now();
@@ -1088,10 +1123,52 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     return;
   }
 
+  // ── Post-ready: flush buffered peers + wire up doc-known peers ───
+
   const readyDoc = await state.handle.doc?.();
+
+  // Flush any peer connections that arrived before the doc was ready
+  // into the shared doc.knownPeers roster.
+  if (readyDoc && preReadyPeers.size > 0) {
+    state.handle.change?.((doc: PiConfigDocument) => {
+      for (const host of preReadyPeers) {
+        doc.knownPeers[host] = {
+          lastSeen: Date.now(),
+          addedBy: hostname,
+        };
+      }
+      preReadyPeers.clear();
+    });
+    // Refresh local mesh roster cache after flushing
+    state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, readyDoc.knownPeers, hostname);
+  }
+
+  // Dynamically create WebSocketClientAdapters for doc-known peers that
+  // aren't already in the config seed list. This makes the mesh self-
+  // healing: once you've connected to any peer, you learn about the full
+  // roster and connect to everyone on the next startup.
+  if (readyDoc && state.repo?.networkSubsystem) {
+    const existingHosts = new Set(state.config.peers.map((p) => peerHost(p)));
+    for (const host of Object.keys(readyDoc.knownPeers)) {
+      if (host === hostname || existingHosts.has(host)) continue;
+      debugLog(`initRepo: creating doc-known adapter for ${host}`);
+      const peer = `${host}:${state.config.port}`;
+      try {
+        const { WebSocketClientAdapter: WSCA } = await import("@automerge/automerge-repo-network-websocket");
+        const adapter = new WSCA(`ws://${peer}`);
+        adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
+        adapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
+        state.repo.networkSubsystem.addNetworkAdapter(adapter);
+        debugLog(`initRepo: doc-known adapter added for ${host}`);
+      } catch (err: any) {
+        debugLog(`initRepo: failed to create adapter for ${host}: ${err?.message ?? err}`);
+      }
+    }
+  }
+
+  // Push our local files into the doc now that we know the full remote
+  // state, so peers learn about anything we have that they don't.
   if (readyDoc) {
-    // Push our local files into the doc now that we know the full remote
-    // state, so peers learn about anything we have that they don't.
     withSuppressedExport(() => {
       state.handle.change?.((doc: PiConfigDocument) => {
         importAllFiles(doc);
@@ -1231,6 +1308,9 @@ export default function (pi: ExtensionAPI) {
 
   state.config = loadConfig();
 
+  // Seed meshPeerHosts from config (doc-known peers get layered in after init)
+  state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, undefined, hostname);
+
   // Write default config if missing
   if (!fs.existsSync(CONFIG_PATH)) {
     atomicWriteFile(CONFIG_PATH, JSON.stringify(DEFAULT_SYNC_CONFIG, null, 2) + "\n");
@@ -1260,23 +1340,36 @@ export default function (pi: ExtensionAPI) {
       const doc = state.handle ? await state.handle.doc?.() : undefined;
       const docUrl = loadDocUrl();
       const onOff = (b: boolean) => b ? "✅" : "❌";
+      const meshHosts = [...state.meshPeerHosts].sort();
       const lines = [
         `**pi-sync**  ─  \`${hostname}\`  :${state.config.port}`,
         ``,
         `Document: \`${docUrl ? docUrl.slice(0, 28) + "…" : "not set"}\``,
-        `Peers (${state.config.peers.length}):`,
-        ...(state.config.peers.length > 0
-          ? state.config.peers.map((p) => {
-              const h = peerHost(p);
+        `Peers (${meshHosts.length}):`,
+        ...(meshHosts.length > 0
+          ? meshHosts.map((h) => {
               const connected = state.wsConnectedPeers.has(h);
               const reachable = !connected && state.tcpReachablePeers.has(h);
               const mark = connected ? "🟢" : reachable ? "🔵" : "🔴";
-              const pending = state.peersAtInit.includes(p) ? "" : " _(pending /reload)_";
+              const isConfigSeed = state.config.peers.some((p) => peerHost(p) === h);
+              const isDocPeer = doc?.knownPeers?.[h];
+              const source = isConfigSeed && isDocPeer ? "config+mesh"
+                : isConfigSeed ? "config seed"
+                : "mesh roster";
+              const peerStr = `${h}:${state.config.port}`;
               let tag = "";
               if (reachable) {
                 tag = "attempting sync, ";
               }
               if (!connected) {
+                if (isDocPeer?.lastSeen) {
+                  const agoMs = Date.now() - isDocPeer.lastSeen;
+                  const ago = agoMs < 60_000 ? `${Math.round(agoMs / 1000)}s`
+                    : agoMs < 3_600_000 ? `${Math.round(agoMs / 60_000)}m`
+                    : agoMs < 86_400_000 ? `${Math.round(agoMs / 3_600_000)}h`
+                    : `${Math.round(agoMs / 86_400_000)}d`;
+                  tag += `last seen ${ago} ago`;
+                }
                 const last = doc?.lastSync?.[h];
                 if (last) {
                   const agoMs = Date.now() - last;
@@ -1284,15 +1377,15 @@ export default function (pi: ExtensionAPI) {
                     : agoMs < 3_600_000 ? `${Math.round(agoMs / 60_000)}m`
                     : agoMs < 86_400_000 ? `${Math.round(agoMs / 3_600_000)}h`
                     : `${Math.round(agoMs / 86_400_000)}d`;
-                  tag += `last connected ${ago} ago`;
+                  tag += `last synced ${ago} ago`;
                 }
               }
               if (tag) tag = ` (${tag})`;
-              return `  ${mark} \`${p}\`${pending}${tag}`;
+              return `  ${mark} \`${peerStr}\`  _${source}_${tag}`;
             })
-          : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
+          : [`  _no peers — connect to get started_`]
         ),
-        ...(peersDivergedFromInit() ? [`  _peer list edited since last reload — run \`/reload\` to apply_`] : []),
+        ...(peersDivergedFromInit() ? [`  _config peer list edited since last reload — run \`/reload\` to apply_`] : []),
         ``,
         `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts  ${onOff(state.config.syncSessions)} sessions`,
         ``,
@@ -1330,18 +1423,20 @@ export default function (pi: ExtensionAPI) {
       const target = parts.slice(1).join(" ");
 
       if (action === "list" || action === "ls") {
-        if (state.config.peers.length === 0) {
+        const meshHosts = [...state.meshPeerHosts].sort();
+        if (meshHosts.length === 0) {
           ctx.ui.notify(
-            "No peers configured.\n\nAdd one: \`/sync:peers add laptop.tailnet.ts.net:3030\`\nAuto-discover: \`/sync:peers scan\`",
+            "No peers in the mesh.\n\nAdd a seed: \`/sync:peers add laptop.tailnet.ts.net:3030\`\nAuto-discover: \`/sync:peers scan\`",
             "info",
           );
         } else {
-          const list = state.config.peers.map((p) => {
-            const h = peerHost(p);
+          const list = meshHosts.map((h) => {
             const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
-            return `  ${mark} \`${p}\``;
+            const isSeed = state.config.peers.some((p) => peerHost(p) === h);
+            const note = isSeed ? " (config seed)" : " (mesh)";
+            return `  ${mark} \`${h}:${state.config.port}\`${note}`;
           }).join("\n");
-          ctx.ui.notify(`**Peers (${state.config.peers.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
+          ctx.ui.notify(`**Peers (${meshHosts.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
         }
         return;
       }
@@ -1361,8 +1456,23 @@ export default function (pi: ExtensionAPI) {
         }
         state.config.peers.push(target);
         saveConfig();
+
+        // Also write to doc.knownPeers so the full mesh learns about this peer
+        const targetHost = peerHost(target);
+        if (state.handle) {
+          state.handle.change?.((doc: PiConfigDocument) => {
+            doc.knownPeers[targetHost] = {
+              lastSeen: Date.now(),
+              addedBy: hostname,
+            };
+          });
+          // Refresh meshPeerHosts from the live doc
+          const liveDoc = await state.handle.doc?.();
+          state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname);
+        }
+
         ctx.ui.notify(
-          `Added peer \`${target}\`. Restart pi or run \`/reload\` to connect.`,
+          `Added peer \`${target}\`. Run \`/reload\` to connect.`,
           "info",
         );
         return;
@@ -1382,11 +1492,21 @@ export default function (pi: ExtensionAPI) {
           (p) => p !== target && peerHost(p) !== targetHost,
         );
         if (state.config.peers.length === before) {
-          ctx.ui.notify(`Peer \`${target}\` not found.`, "info");
+          ctx.ui.notify(`Peer \`${target}\` not found in config.`, "info");
         } else {
           state.wsConnectedPeers.delete(targetHost);
           state.tcpReachablePeers.delete(targetHost);
           saveConfig();
+
+          // Also remove from doc.knownPeers
+          if (state.handle) {
+            state.handle.change?.((doc: PiConfigDocument) => {
+              delete doc.knownPeers[targetHost];
+            });
+            const liveDoc = await state.handle.doc?.();
+            state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname);
+          }
+
           ctx.ui.notify(`Removed \`${target}\`. Run \`/reload\` to disconnect from the running session.`, "info");
         }
         return;

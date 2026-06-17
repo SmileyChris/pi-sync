@@ -16,8 +16,8 @@ import { state, REFRESH_ICON_DURATION_MS } from "./state";
 
 export function getSyncLabel(): string {
   if (state.standbyMode) return "⛓️  standby";
-  const total = state.config.peers.length;
-  const wsOnline = state.config.peers.filter((p) => state.wsConnectedPeers.has(peerHost(p))).length;
+  const total = state.meshPeerHosts.size;
+  const wsOnline = [...state.meshPeerHosts].filter((h) => state.wsConnectedPeers.has(h)).length;
   const showRefresh = Date.now() - state.lastRemoteChangeTime < REFRESH_ICON_DURATION_MS;
 
   let label: string;

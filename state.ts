@@ -60,6 +60,10 @@ export type SyncState = {
   // disk, but the live adapter set won't change until /reload. This
   // snapshot lets /sync:status surface "edited since last reload".
   peersAtInit: string[];
+  // Cached union of config.peers + doc.knownPeers (hostnames only).
+  // Updated at init and whenever the doc's knownPeers changes.
+  // Footer and /sync:status read this to show the full mesh roster.
+  meshPeerHosts: Set<string>;
 };
 
 const STATE_KEY = Symbol.for("pi-sync:state");
@@ -93,4 +97,5 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object
   pendingInstalls: new Set(),
   installRunning: false,
   peersAtInit: [],
+  meshPeerHosts: new Set(),
 }));

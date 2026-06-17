@@ -21,12 +21,19 @@ export interface SyncedFile {
   deletedBy?: string;
 }
 
+export interface KnownPeer {
+  lastSeen: number;
+  addedBy: string;
+}
+
 export interface PiConfigDocument {
   settings: Record<string, unknown>;
   models: Record<string, unknown>;
   extensions: Record<string, SyncedFile>;
   skills: Record<string, SyncedFile>;
   prompts: Record<string, SyncedFile>;
+  sessions: Record<string, SyncedFile>;
+  knownPeers: Record<string, KnownPeer>;
   localOnly: Record<string, string[]>;
   lastSync: Record<string, number>;
 }
@@ -538,6 +545,48 @@ export function isDocEmpty(doc: PiConfigDocument): boolean {
     Object.keys(doc.settings).length === 0 &&
     Object.keys(doc.models).length === 0
   );
+}
+
+/**
+ * Compute the effective set of peer hostnames by unioning config seeds
+ * and doc's knownPeers roster (excluding self). Returns unique hostnames.
+ */
+/** Compute and return the set of mesh peer hostnames from config seeds
+ *  and doc knownPeers (excluding self). Pure — takes inputs, returns set. */
+export function computeMeshPeerHosts(
+  configPeers: string[],
+  docKnownPeers: Record<string, KnownPeer> | undefined,
+  hostname: string,
+): Set<string> {
+  const hosts = new Set<string>();
+  for (const p of configPeers) {
+    const h = peerHost(p);
+    if (h !== hostname) hosts.add(h);
+  }
+  if (docKnownPeers) {
+    for (const h of Object.keys(docKnownPeers)) {
+      if (h !== hostname) hosts.add(h);
+    }
+  }
+  return hosts;
+}
+
+export function effectivePeers(
+  configPeers: string[],
+  docKnownPeers: Record<string, KnownPeer> | undefined,
+  hostname: string,
+): string[] {
+  const hosts = new Set<string>();
+  for (const p of configPeers) {
+    const h = peerHost(p);
+    if (h !== hostname) hosts.add(h);
+  }
+  if (docKnownPeers) {
+    for (const h of Object.keys(docKnownPeers)) {
+      if (h !== hostname) hosts.add(h);
+    }
+  }
+  return [...hosts];
 }
 
 // ── Peer helpers ─────────────────────────────────────────────────────
