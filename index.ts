@@ -1269,9 +1269,13 @@ export default function (pi: ExtensionAPI) {
           ? state.config.peers.map((p) => {
               const h = peerHost(p);
               const connected = state.wsConnectedPeers.has(h);
-              const mark = connected ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
+              const reachable = !connected && state.tcpReachablePeers.has(h);
+              const mark = connected ? "🟢" : reachable ? "🔵" : "🔴";
               const pending = state.peersAtInit.includes(p) ? "" : " _(pending /reload)_";
-              let extra = "";
+              let tag = "";
+              if (reachable) {
+                tag = "attempting sync, ";
+              }
               if (!connected) {
                 const last = doc?.lastSync?.[h];
                 if (last) {
@@ -1280,16 +1284,16 @@ export default function (pi: ExtensionAPI) {
                     : agoMs < 3_600_000 ? `${Math.round(agoMs / 60_000)}m`
                     : agoMs < 86_400_000 ? `${Math.round(agoMs / 3_600_000)}h`
                     : `${Math.round(agoMs / 86_400_000)}d`;
-                  extra = `  (last seen ${ago} ago)`;
+                  tag += `last connected ${ago} ago`;
                 }
               }
-              return `  ${mark} \`${p}\`${pending}${extra}`;
+              if (tag) tag = ` (${tag})`;
+              return `  ${mark} \`${p}\`${pending}${tag}`;
             })
           : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
         ),
         ...(peersDivergedFromInit() ? [`  _peer list edited since last reload — run \`/reload\` to apply_`] : []),
         ``,
-        `🟢 connected  🔵 reachable  🔴 offline`,
         `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts  ${onOff(state.config.syncSessions)} sessions`,
         ``,
         `Tracked: 🔌 ${countTopDirs(doc?.extensions)} extensions  🔧 ${countTopDirs(doc?.skills)} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts  📜 ${Object.keys(doc?.sessions ?? {}).length} sessions`,
