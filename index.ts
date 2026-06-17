@@ -295,6 +295,12 @@ function sessionImportPath(key: string): string | null {
   return piPathForKey(key);
 }
 
+function countTopDirs(collection: Record<string, unknown> | undefined): number {
+  if (!collection) return 0;
+  // Keys are "subdir/name/..." — count unique top-level names under the subdir
+  return new Set(Object.keys(collection).map((k) => k.split("/")[1])).size;
+}
+
 function trashPathForKey(fileKey: string): string | null {
   return pathForFileKey(TRASH_DIR, fileKey);
 }
@@ -1270,7 +1276,7 @@ export default function (pi: ExtensionAPI) {
         ``,
         `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts  ${onOff(state.config.syncSessions)} sessions`,
         ``,
-        `Tracked: 🔌 ${Object.keys(doc?.extensions ?? {}).length} extensions  🔧 ${Object.keys(doc?.skills ?? {}).length} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts  📜 ${Object.keys(doc?.sessions ?? {}).length} sessions`,
+        `Tracked: 🔌 ${countTopDirs(doc?.extensions)} extensions  🔧 ${countTopDirs(doc?.skills)} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts  📜 ${Object.keys(doc?.sessions ?? {}).length} sessions`,
         `Local-only: \`${Object.keys(doc?.localOnly ?? {}).length}\` entries`,
       ];
 
