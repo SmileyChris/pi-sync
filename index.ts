@@ -1268,9 +1268,22 @@ export default function (pi: ExtensionAPI) {
         ...(state.config.peers.length > 0
           ? state.config.peers.map((p) => {
               const h = peerHost(p);
-              const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
+              const connected = state.wsConnectedPeers.has(h);
+              const mark = connected ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
               const pending = state.peersAtInit.includes(p) ? "" : " _(pending /reload)_";
-              return `  ${mark} \`${p}\`${pending}`;
+              let extra = "";
+              if (!connected) {
+                const last = doc?.lastSync?.[h];
+                if (last) {
+                  const agoMs = Date.now() - last;
+                  const ago = agoMs < 60_000 ? `${Math.round(agoMs / 1000)}s`
+                    : agoMs < 3_600_000 ? `${Math.round(agoMs / 60_000)}m`
+                    : agoMs < 86_400_000 ? `${Math.round(agoMs / 3_600_000)}h`
+                    : `${Math.round(agoMs / 86_400_000)}d`;
+                  extra = `  (last seen ${ago} ago)`;
+                }
+              }
+              return `  ${mark} \`${p}\`${pending}${extra}`;
             })
           : [`  _none configured — use \`/sync:peers add <host:port>\`_`]
         ),
