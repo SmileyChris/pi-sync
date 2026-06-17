@@ -1289,6 +1289,7 @@ export default function (pi: ExtensionAPI) {
         ),
         ...(peersDivergedFromInit() ? [`  _peer list edited since last reload — run \`/reload\` to apply_`] : []),
         ``,
+        `🟢 connected  🔵 reachable  🔴 offline`,
         `Syncing: ${onOff(state.config.syncSettings)} settings  ${onOff(state.config.syncModels)} models  ${onOff(state.config.syncExtensions)} extensions  ${onOff(state.config.syncSkills)} skills  ${onOff(state.config.syncPrompts)} prompts  ${onOff(state.config.syncSessions)} sessions`,
         ``,
         `Tracked: 🔌 ${countTopDirs(doc?.extensions)} extensions  🔧 ${countTopDirs(doc?.skills)} skills  ✏️ ${Object.keys(doc?.prompts ?? {}).length} prompts  📜 ${Object.keys(doc?.sessions ?? {}).length} sessions`,
