@@ -34,8 +34,8 @@
 
 import type { PeerId } from "@automerge/automerge-repo";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { DynamicBorder, getMarkdownTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { installFooter } from "./footer";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -1411,7 +1411,20 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      ctx.ui.notify(lines.join("\n"), "info");
+      await ctx.ui.custom((_tui, theme, _kb, done) => {
+        const mdTheme = getMarkdownTheme();
+        const md = new Markdown(lines.join("\n"), 1, 1, mdTheme);
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(md);
+        container.addChild(new Text(theme.fg("dim", "any key to dismiss"), 1, 0));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (_data: string) => done(undefined),
+        };
+      });
     },
   });
 
@@ -1424,20 +1437,31 @@ export default function (pi: ExtensionAPI) {
 
       if (action === "list" || action === "ls") {
         const meshHosts = [...state.meshPeerHosts].sort();
-        if (meshHosts.length === 0) {
-          ctx.ui.notify(
-            "No peers in the mesh.\n\nAdd a seed: \`/sync:peers add laptop.tailnet.ts.net:3030\`\nAuto-discover: \`/sync:peers scan\`",
-            "info",
-          );
-        } else {
-          const list = meshHosts.map((h) => {
-            const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
-            const isSeed = state.config.peers.some((p) => peerHost(p) === h);
-            const note = isSeed ? " (config seed)" : " (mesh)";
-            return `  ${mark} \`${h}:${state.config.port}\`${note}`;
-          }).join("\n");
-          ctx.ui.notify(`**Peers (${meshHosts.length}):**\n${list}\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`, "info");
-        }
+        const mdContent = meshHosts.length === 0
+          ? "No peers in the mesh.\n\nAdd a seed: `/sync:peers add laptop.tailnet.ts.net:3030`\nAuto-discover: `/sync:peers scan`"
+          : `**Peers (${meshHosts.length}):**\n` +
+            meshHosts.map((h) => {
+              const mark = state.wsConnectedPeers.has(h) ? "🟢" : state.tcpReachablePeers.has(h) ? "🔵" : "🔴";
+              const isSeed = state.config.peers.some((p) => peerHost(p) === h);
+              const note = isSeed ? " (config seed)" : " (mesh)";
+              return `  ${mark} \`${h}:${state.config.port}\`${note}`;
+            }).join("\n") +
+            `\n\n🟢 WS-connected  🔵 TCP reachable  🔴 offline`;
+
+        await ctx.ui.custom((_tui, theme, _kb, done) => {
+          const mdTheme = getMarkdownTheme();
+          const md = new Markdown(mdContent, 1, 1, mdTheme);
+          const container = new Container();
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          container.addChild(md);
+          container.addChild(new Text(theme.fg("dim", "any key to dismiss"), 1, 0));
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          return {
+            render: (w: number) => container.render(w),
+            invalidate: () => container.invalidate(),
+            handleInput: (_data: string) => done(undefined),
+          };
+        });
         return;
       }
 
