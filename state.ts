@@ -69,7 +69,7 @@ export type SyncState = {
 const STATE_KEY = Symbol.for("pi-sync:state");
 type StateHost = typeof globalThis & { [STATE_KEY]?: SyncState };
 
-export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object.seal({
+export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
   config: { ...DEFAULT_SYNC_CONFIG },
   repo: null,
   handle: null,
@@ -98,4 +98,4 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= Object
   installRunning: false,
   peersAtInit: [],
   meshPeerHosts: new Set(),
-}));
+})); // not sealed — allows schema migration across reloads
