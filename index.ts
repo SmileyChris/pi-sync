@@ -37,6 +37,7 @@ import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding
 import { DynamicBorder, getMarkdownTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { installFooter } from "./footer";
+import * as dns from "node:dns";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -839,7 +840,7 @@ function installCrashGuard() {
   process.prependListener("unhandledRejection", (reason) => onCrash(reason, "rejection"));
 }
 
-async function initRepo(pi: ExtensionAPI): Promise<void> {
+async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Promise<void> {
   debugLog(`initRepo: START, peers=${JSON.stringify(state.config.peers)}, hostname=${hostname}`);
   // Synchronous guard set before any await — see SyncState.initInProgress.
   state.initInProgress = true;
@@ -957,13 +958,22 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // Also buffer peers that connect before the doc is ready — we flush
   // them into doc.knownPeers after whenReady resolves.
   const preReadyPeers = new Set<string>();
-  const trackPeer = (peerId: PeerId) => {
+  const trackPeer = (peerId: PeerId, configPeerName?: string) => {
     const host = (peerId as string).replace(/^pi-sync-/, "");
-    debugLog(`peer-candidate: ${host}`);
+    debugLog(`peer-candidate: ${host}${configPeerName ? ` (via config peer ${configPeerName})` : ""}`);
     state.wsConnectedPeers.set(host, { since: Date.now(), direction: "in" });
     // Add to meshPeerHosts synchronously so the footer updates immediately.
     // The change listener will recompute the full set when the doc write lands.
     state.meshPeerHosts.add(host);
+    // Record alias if the real host differs from the config peer name.
+    // This lets us skip duplicate doc-known adapters on future reloads.
+    if (configPeerName && host !== configPeerName) {
+      if (state.config.peerAliases[host] !== configPeerName) {
+        state.config.peerAliases[host] = configPeerName;
+        saveConfig();
+        debugLog(`peer-candidate: recorded alias ${host} → ${configPeerName}`);
+      }
+    }
     // Write to doc's knownPeers roster (shared mesh directory)
     if (state.handle) {
       state.handle.change?.((doc: PiConfigDocument) => {
@@ -1017,7 +1027,8 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       debugLog(`disconnect-wrapped: completed for ${peer}`);
     };
     // Track outbound connection state via adapter events
-    adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
+    const configHost = peerHost(peer);
+    adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId, configHost));
     adapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
     adapters.push(adapter);
   }
@@ -1093,7 +1104,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
 
     // If knownPeers changed, refresh the mesh roster cache
     if (patches.length === 0 || patches.some((p: any) => p.path[0] === "knownPeers")) {
-      state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, doc.knownPeers, hostname);
+      state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, doc.knownPeers, hostname, state.config.peerAliases);
     }
 
     // Track remote changes for the footer widget and /sync:status
@@ -1146,7 +1157,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
       preReadyPeers.clear();
     });
     // Refresh local mesh roster cache after flushing
-    state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, readyDoc.knownPeers, hostname);
+    state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, readyDoc.knownPeers, hostname, state.config.peerAliases);
   }
 
   // Dynamically create WebSocketClientAdapters for doc-known peers that
@@ -1157,11 +1168,46 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     const existingHosts = new Set(state.config.peers.map((p) => peerHost(p)));
     for (const host of Object.keys(readyDoc.knownPeers || {})) {
       if (host === hostname || existingHosts.has(host)) continue;
+      // Skip doc-known hosts that are aliases of a config peer (e.g.
+      // "chris-ms7b85" behind "work") — the config adapter already
+      // covers the same machine and a direct connection would fail.
+      const alias = state.config.peerAliases[host];
+      if (alias && existingHosts.has(alias)) {
+        debugLog(`initRepo: skipping doc-known adapter for ${host} (alias of config peer ${alias})`);
+        continue;
+      }
+      // Pre-flight DNS check: skip hosts that can't resolve at all.
+      // Avoids uncaught ENOTFOUND that the adapter's onError would throw.
+      try {
+        await dns.promises.lookup(host);
+      } catch (dnsErr: any) {
+        debugLog(`initRepo: skipping doc-known adapter for ${host} (DNS: ${dnsErr?.code ?? dnsErr?.message ?? dnsErr})`);
+        continue;
+      }
       debugLog(`initRepo: creating doc-known adapter for ${host}`);
       const peer = `${host}:${state.config.port}`;
       try {
         const { WebSocketClientAdapter: WSCA } = await import("@automerge/automerge-repo-network-websocket");
         const adapter = new WSCA(`ws://${peer}`);
+        // Wrap onError and disconnect with the same protection as config
+        // adapters — prevents uncaught exceptions from late DNS failures,
+        // connection resets, etc.
+        const origOnError = (adapter as any).onError;
+        (adapter as any).onError = ((event: any) => {
+          const code = event?.error?.code || event?.code || '?';
+          debugLog(`doc-known onError-wrapped: ${host}, code=${code}`);
+          try { origOnError.call(adapter, event); }
+          catch (err: any) {
+            debugLog(`doc-known onError CAUGHT for ${host}: ${err?.message ?? err}`);
+          }
+        }) as typeof origOnError;
+        const origDisconnect = (adapter as any).disconnect;
+        (adapter as any).disconnect = () => {
+          try { origDisconnect.call(adapter); }
+          catch (err: any) {
+            debugLog(`doc-known disconnect CAUGHT for ${host}: ${err?.message ?? err}`);
+          }
+        };
         adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
         adapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
         state.repo.networkSubsystem.addNetworkAdapter(adapter);
@@ -1252,7 +1298,7 @@ async function waitForLocalSyncSocketClose(port: number): Promise<"closed" | "un
   });
 }
 
-async function watchAndTakeOver(pi: ExtensionAPI) {
+async function watchAndTakeOver(pi: ExtensionAPI, saveConfig: () => void = () => {}) {
   state.standbyMode = true;
   const port = normalizeProbePort(state.config.port);
   if (port == null) {
@@ -1281,14 +1327,14 @@ async function watchAndTakeOver(pi: ExtensionAPI) {
     debugLog(
       `Another instance took port ${state.config.port} — resuming standby`,
     );
-    watchAndTakeOver(pi).catch((e: any) =>
+    watchAndTakeOver(pi, saveConfig).catch((e: any) =>
       debugLog(`Watchdog failed: ${e?.message ?? e}`),
     );
     return;
   }
 
   state.standbyMode = false;
-  await initRepo(pi);
+  await initRepo(pi, saveConfig);
 
   // Re-render the footer immediately after takeover so the TUI
   // layout re-flows and the footer line doesn't appear off by one.
@@ -1315,7 +1361,7 @@ export default function (pi: ExtensionAPI) {
   state.config = loadConfig();
 
   // Seed meshPeerHosts from config (doc-known peers get layered in after init)
-  state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, undefined, hostname);
+  state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, undefined, hostname, state.config.peerAliases);
 
   // Write default config if missing
   if (!fs.existsSync(CONFIG_PATH)) {
@@ -1498,7 +1544,7 @@ export default function (pi: ExtensionAPI) {
           });
           // Refresh meshPeerHosts from the live doc
           const liveDoc = await state.handle.doc?.();
-          state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname);
+          state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname, state.config.peerAliases);
         }
 
         ctx.ui.notify(
@@ -1534,7 +1580,7 @@ export default function (pi: ExtensionAPI) {
               delete doc.knownPeers[targetHost];
             });
             const liveDoc = await state.handle.doc?.();
-            state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname);
+            state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, liveDoc?.knownPeers, hostname, state.config.peerAliases);
           }
 
           ctx.ui.notify(`Removed \`${target}\`. Run \`/reload\` to disconnect from the running session.`, "info");
@@ -1712,7 +1758,20 @@ export default function (pi: ExtensionAPI) {
       ``,
       `They'll automatically pull all synced extensions and skills.`,
     ];
-    ctx.ui.notify(lines.join("\n"), "info");
+    await ctx.ui.custom((_tui, theme, _kb, done) => {
+      const mdTheme = getMarkdownTheme();
+      const md = new Markdown(lines.join("\n"), 1, 1, mdTheme);
+      const container = new Container();
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+      container.addChild(md);
+      container.addChild(new Text(theme.fg("dim", "any key to dismiss"), 1, 0));
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+      return {
+        render: (w: number) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (_data: string) => done(undefined),
+      };
+    });
   };
 
   pi.registerCommand("sync:info", {
@@ -1758,7 +1817,7 @@ export default function (pi: ExtensionAPI) {
       // Re-initialize with a fresh state
       state.config = loadConfig();
       try {
-        await initRepo(pi);
+        await initRepo(pi, saveConfig);
         // After fresh init, restart runtime loops stopped during unlink.
         startFileWatcher();
         startPurgeTimer();
@@ -1943,7 +2002,7 @@ export default function (pi: ExtensionAPI) {
     state.activeUi = ctx.ui;
     state.currentCtx = ctx;
     installFooter(ctx.ui);
-    startSyncInBackground(pi);
+    startSyncInBackground(pi, saveConfig);
 
     // No importAllFiles here: initRepo pushes local files during sync
     // startup, and the fs.watch loop catches any changes made while pi
@@ -1980,7 +2039,7 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
-function startSyncInBackground(pi: ExtensionAPI) {
+function startSyncInBackground(pi: ExtensionAPI, saveConfig: () => void = () => {}) {
   // Re-entry guard: when pi reloads extensions inside the same process
   // (e.g. on `/new`), the module body re-executes against the singleton
   // `state` on globalThis. Three flags say "the previous instance still
@@ -2014,11 +2073,11 @@ function startSyncInBackground(pi: ExtensionAPI) {
         // watchAndTakeOver's first synchronous step sets state.standbyMode,
         // so the guard takes over from initInProgress as soon as the .catch
         // below returns.
-        watchAndTakeOver(pi).catch((e: any) =>
+        watchAndTakeOver(pi, saveConfig).catch((e: any) =>
           debugLog(`Watchdog failed: ${e?.message ?? e}`),
         );
       } else {
-        await initRepo(pi);
+        await initRepo(pi, saveConfig);
         startFileWatcher();
         startPurgeTimer();
         startProbing();

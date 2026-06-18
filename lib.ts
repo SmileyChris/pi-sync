@@ -41,6 +41,11 @@ export interface PiConfigDocument {
 export interface SyncConfig {
   port: number;
   peers: string[];
+  /** Maps real hostnames → config peer hostnames. Populated automatically
+   *  when a peer-candidate event reveals the remote machine's actual
+   *  hostname differs from the config peer alias (e.g. "chris-ms7b85" →
+   *  "work"). Used to skip creating duplicate doc-known adapters. */
+  peerAliases: Record<string, string>;
   syncSettings: boolean;
   syncExtensions: boolean;
   syncSkills: boolean;
@@ -54,6 +59,7 @@ export type Subdir = "settings" | "models" | "extensions" | "skills" | "prompts"
 export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   port: 3030,
   peers: [],
+  peerAliases: {},
   syncSettings: true,
   syncExtensions: true,
   syncSkills: true,
@@ -552,20 +558,30 @@ export function isDocEmpty(doc: PiConfigDocument): boolean {
  * and doc's knownPeers roster (excluding self). Returns unique hostnames.
  */
 /** Compute and return the set of mesh peer hostnames from config seeds
- *  and doc knownPeers (excluding self). Pure — takes inputs, returns set. */
+ *  and doc knownPeers (excluding self). Pure — takes inputs, returns set.
+ *  peerAliases maps real hostnames → config peer hostnames, so a doc-known
+ *  host that is an alias of a config peer is excluded (no duplicate). */
 export function computeMeshPeerHosts(
   configPeers: string[],
   docKnownPeers: Record<string, KnownPeer> | undefined,
   hostname: string,
+  peerAliases?: Record<string, string>,
 ): Set<string> {
   const hosts = new Set<string>();
+  const configHosts = new Set<string>();
   for (const p of configPeers) {
     const h = peerHost(p);
-    if (h !== hostname) hosts.add(h);
+    if (h !== hostname) {
+      hosts.add(h);
+      configHosts.add(h);
+    }
   }
   if (docKnownPeers) {
     for (const h of Object.keys(docKnownPeers)) {
-      if (h !== hostname) hosts.add(h);
+      if (h === hostname) continue;
+      // If this host is an alias for a config host, skip — already covered
+      if (peerAliases?.[h] && configHosts.has(peerAliases[h])) continue;
+      hosts.add(h);
     }
   }
   return hosts;
@@ -575,15 +591,22 @@ export function effectivePeers(
   configPeers: string[],
   docKnownPeers: Record<string, KnownPeer> | undefined,
   hostname: string,
+  peerAliases?: Record<string, string>,
 ): string[] {
   const hosts = new Set<string>();
+  const configHosts = new Set<string>();
   for (const p of configPeers) {
     const h = peerHost(p);
-    if (h !== hostname) hosts.add(h);
+    if (h !== hostname) {
+      hosts.add(h);
+      configHosts.add(h);
+    }
   }
   if (docKnownPeers) {
     for (const h of Object.keys(docKnownPeers)) {
-      if (h !== hostname) hosts.add(h);
+      if (h === hostname) continue;
+      if (peerAliases?.[h] && configHosts.has(peerAliases[h])) continue;
+      hosts.add(h);
     }
   }
   return [...hosts];
