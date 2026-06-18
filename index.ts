@@ -1149,7 +1149,7 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
   // roster and connect to everyone on the next startup.
   if (readyDoc && state.repo?.networkSubsystem) {
     const existingHosts = new Set(state.config.peers.map((p) => peerHost(p)));
-    for (const host of Object.keys(readyDoc.knownPeers)) {
+    for (const host of Object.keys(readyDoc.knownPeers || {})) {
       if (host === hostname || existingHosts.has(host)) continue;
       debugLog(`initRepo: creating doc-known adapter for ${host}`);
       const peer = `${host}:${state.config.port}`;
