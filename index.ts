@@ -1074,6 +1074,12 @@ async function initRepo(pi: ExtensionAPI): Promise<void> {
     notifyActive(`Imported ${files.length} files into new sync document`, "info");
   }
 
+  // Ensure knownPeers exists on documents created before this field was added.
+  // Do this once, early, so all downstream code can safely write to it.
+  state.handle.change?.((doc: PiConfigDocument) => {
+    if (!doc.knownPeers) doc.knownPeers = {};
+  });
+
   // Attach the change listener BEFORE awaiting whenReady so we don't miss
   // patches, but gate exports on `state.initialSyncReady`. Without the gate,
   // each sync patch arriving mid-snapshot writes a partial tree to disk.
