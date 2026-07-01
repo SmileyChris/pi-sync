@@ -1132,7 +1132,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
 
   // ── Network adapters ──────────────────────────────────────────────
 
-  const serverAdapter = new NodeWSServerAdapter(state.wss);
+  const serverAdapter = new NodeWSServerAdapter(state.wss, 30_000);
   const adapters: any[] = [serverAdapter];
 
   for (const peer of state.config.peers) {
