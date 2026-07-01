@@ -9,6 +9,7 @@
  */
 
 import type * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { type SyncConfig, DEFAULT_SYNC_CONFIG } from "./lib";
@@ -28,7 +29,18 @@ export type SyncState = {
   repo: any;
   handle: any;
   wss: any;
+  httpServer: http.Server | null;
   watcher: fs.FSWatcher | null;
+  /** WebSocket client sockets connected for session file sync. */
+  sessionSyncSockets: Set<any>;
+  /** Debounce timer for batching session file broadcasts. */
+  sessionSyncTimer: ReturnType<typeof setTimeout> | null;
+  /** Keys of session files that changed since last broadcast. */
+  pendingSessionChanges: Set<string>;
+  /** True while writing a received session file (suppress re-broadcast). */
+  receivingSessionFile: boolean;
+  /** fs.Watcher for session files (non-CRDT sync). */
+  sessionWatcher: fs.FSWatcher | null;
   ImmutableString: any;
   wsConnectedPeers: Map<string, { since: number; direction: "in" | "out" }>;
   tcpReachablePeers: Set<string>;
@@ -74,7 +86,13 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
   repo: null,
   handle: null,
   wss: null,
+  httpServer: null,
   watcher: null,
+  sessionSyncSockets: new Set(),
+  sessionSyncTimer: null,
+  pendingSessionChanges: new Set(),
+  receivingSessionFile: false,
+  sessionWatcher: null,
   ImmutableString: null,
   wsConnectedPeers: new Map(),
   tcpReachablePeers: new Set(),

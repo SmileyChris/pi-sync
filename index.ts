@@ -29,6 +29,7 @@
  *   /sync:unlink       – detach from the sync network
  *   /sync:peers        – manage peer list (add/remove/list/scan)
  *   /sync:config       – interactive settings panel (toggle sync categories)
+ *   /sync:prune-sessions – remove old session entries from the document
  *   /sync:local-only   – manage local-only files
  */
 
@@ -39,6 +40,7 @@ import { Container, Markdown, type SettingItem, SettingsList, Text } from "@eare
 import { installFooter } from "./footer";
 import * as dns from "node:dns";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as path from "node:path";
 
 // ── Debug logging ────────────────────────────────────────────────────
@@ -645,6 +647,110 @@ async function flushPendingChanges() {
   });
 }
 
+// ── Session file sync (non-CRDT) ────────────────────────────────────
+
+/** Handle an incoming HTTP POST /session-sync request from a peer.
+ *  Writes the session file to disk and suppresses re-broadcast. */
+function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+  const chunks: Buffer[] = [];
+  req.on("data", (c: Buffer) => chunks.push(c));
+  req.on("end", () => {
+    try {
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      const key = normalizeFileKey(body.key);
+      if (!key || !key.startsWith("sessions/")) {
+        res.writeHead(400);
+        res.end("Invalid key");
+        return;
+      }
+      const absPath = piPathForKey(key);
+      if (!absPath) { res.writeHead(400); res.end(); return; }
+      ensureDir(path.dirname(absPath));
+      state.receivingSessionFile = true;
+      try { fs.writeFileSync(absPath, body.content, "utf-8"); }
+      finally { state.receivingSessionFile = false; }
+      debugLog(`session-sync: received ${key}`);
+      res.writeHead(200);
+      res.end("ok");
+    } catch (e: any) {
+      debugLog(`session-sync: receive error: ${e?.message ?? e}`);
+      res.writeHead(500);
+      res.end();
+    }
+  });
+}
+
+/** Collect pending session changes and POST them to connected peers.
+ *  Session files are sync'd file-by-file over HTTP (not Automerge)
+ *  because they are append-only, hostname-namespaced, and don't need
+ *  CRDT merging. */
+function broadcastPendingSessionFiles() {
+  if (state.pendingSessionChanges.size === 0) return;
+  const changes = [...state.pendingSessionChanges];
+  state.pendingSessionChanges.clear();
+
+  for (const peer of state.config.peers) {
+    const ph = peerHost(peer);
+    if (ph === hostname) continue;
+    const peerUrl = `http://${peer}/session-sync`;
+    for (const key of changes) {
+      const absPath = piPathForKey(key);
+      if (!absPath) continue;
+      let content: string;
+      try { content = fs.readFileSync(absPath, "utf-8"); }
+      catch { continue; }
+      const body = JSON.stringify({ key, content });
+      // Fire-and-forget POST — don't block on peer connectivity
+      void (async () => {
+        try {
+          const { request } = await import("node:http");
+          await new Promise<void>((resolve, reject) => {
+            const r = request(peerUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            }, (res) => { res.resume(); resolve(); });
+            r.on("error", reject);
+            r.write(body);
+            r.end();
+          });
+        } catch { /* peer unreachable — try next time */ }
+      })();
+    }
+  }
+}
+
+/** Watch for session file changes and broadcast them to peers. */
+function startSessionSync() {
+  if (state.config.peers.length === 0) {
+    debugLog(`session-sync: no peers, skipping session sync`);
+    return;
+  }
+  try {
+    const sessionsDir = path.join(PI_DIR, "sessions");
+    if (!fs.existsSync(sessionsDir)) return;
+    state.sessionWatcher = fs.watch(sessionsDir, { recursive: true }, (_eventType, filename) => {
+      if (!filename || !filename.endsWith(".jsonl")) return;
+      const key = normalizeFileKey(`sessions/${filename}`);
+      if (!key) return;
+      // Skip if we just wrote this file from a peer broadcast
+      if (state.receivingSessionFile) return;
+      state.pendingSessionChanges.add(key);
+      if (state.sessionSyncTimer) clearTimeout(state.sessionSyncTimer);
+      state.sessionSyncTimer = setTimeout(broadcastPendingSessionFiles, 2000);
+    });
+    debugLog(`session-sync: watcher started on ${sessionsDir}`);
+  } catch (err) {
+    debugLog(`session-sync: watcher failed: ${err}`);
+  }
+}
+
+function stopSessionSync() {
+  if (state.sessionSyncTimer) { clearTimeout(state.sessionSyncTimer); state.sessionSyncTimer = null; }
+  if (state.sessionWatcher) { state.sessionWatcher.close(); state.sessionWatcher = null; }
+  state.pendingSessionChanges.clear();
+  state.sessionSyncSockets.clear();
+}
+
 function startFileWatcher() {
   if (state.watcher) return;
   try {
@@ -851,6 +957,15 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
 
   installCrashGuard();
 
+  // Yield to the event loop so the TUI can finish its initial paint
+  // and process buffered user input before Automerge's 2.7 MB WASM
+  // binary is loaded and compiled (which blocks the main thread
+  // synchronously for 3-5 seconds when `import("@automerge/automerge-repo")`
+  // evaluates the module and calls `new WebAssembly.Module()`).
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const t0 = Date.now();
+
   // Dynamic imports to avoid jiti/WASM top-level import issues
   const [{ WebSocketServer, default: WS }, { Repo, ImmutableString: IS }, { NodeFSStorageAdapter }, netModule] =
     await Promise.all([
@@ -859,6 +974,9 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
       import("@automerge/automerge-repo-storage-nodefs"),
       import("@automerge/automerge-repo-network-websocket"),
     ]);
+
+  const t1 = Date.now();
+  debugLog(`initRepo: dynamic imports took ${t1 - t0}ms (ws + automerge-repo + storage + network)`);
 
   // Monkey-patch net.Socket.prototype.connect to prevent raw TCP
   // errors from orphaned WebSocket connections. The adapter's retry
@@ -937,10 +1055,22 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     return _origAdapterConnect.call(this, peerId, peerMetadata);
   };
 
-  // ── WebSocket server ──────────────────────────────────────────────
+  // ── HTTP server (routes WS upgrades + session sync) ───────────────
+  // Share one TCP port: Automerge WebSocket on the default path,
+  // session file sync via POST /session-sync. This avoids needing a
+  // second port and keeps session files out of the Automerge CRDT.
+  const httpServer = http.createServer((req, res) => {
+    // Only handle POST /session-sync — everything else is WebSocket
+    if (req.method === "POST" && req.url === "/session-sync") {
+      handleSessionSyncRequest(req, res);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  state.httpServer = httpServer;
 
-  state.wss = new WebSocketServer({ port: state.config.port });
-
+  state.wss = new WebSocketServer({ noServer: true });
   state.wss.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
       notifyActive(
@@ -952,6 +1082,14 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
       debugLog(`WS server error: ${err.message}`);
     }
   });
+
+  httpServer.on("upgrade", (req, socket, head) => {
+    state.wss.handleUpgrade(req, socket, head, (ws: any) => {
+      state.wss.emit("connection", ws, req);
+    });
+  });
+  httpServer.listen(state.config.port);
+  debugLog(`initRepo: HTTP+WS server listening on port ${state.config.port}`);
 
   // Track connections via Automerge adapter events (not raw TCP) so we
   // capture both inbound and outbound peers under their real hostnames.
@@ -1053,10 +1191,13 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
   const docUrl = loadDocUrl();
 
   if (docUrl) {
-    // Joining an existing network — find the document, then push our
-    // local state so other peers learn about any extensions/skills
-    // this machine has that they don't know about yet.
-    state.handle = await state.repo.find(docUrl);
+    // Use findWithProgress instead of find() to avoid blocking the main
+    // thread for 3-5 seconds. find() awaits synchronous WASM deserial-
+    // ization of the ~44MB Automerge document. findWithProgress returns
+    // a DocHandle immediately and loads the document asynchronously in
+    // the background — the TUI stays responsive the whole time.
+    const progress = state.repo.findWithProgress(docUrl);
+    state.handle = progress.handle;
   } else {
     // First run — create fresh document, then import files one at a time
     state.handle = state.repo.create({
@@ -1075,21 +1216,23 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     });
     saveDocUrl(state.handle.url);
 
+    // Yield before file collection so the TUI can finish its initial
+    // paint before we walk the ~794MB agent directory tree.
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+
     // Import files incrementally to avoid WASM capacity overflow
+    const tCollect = Date.now();
     const files = collectAllFiles();
+    debugLog(`initRepo: collectAllFiles found ${files.length} files in ${Date.now() - tCollect}ms`);
+    const tImport = Date.now();
     for (const fileKey of files) {
       state.handle.change((doc: PiConfigDocument) => {
         importFile(doc, fileKey);
       });
     }
+    debugLog(`initRepo: file imports took ${Date.now() - tImport}ms for ${files.length} files`);
     notifyActive(`Imported ${files.length} files into new sync document`, "info");
   }
-
-  // Ensure knownPeers exists on documents created before this field was added.
-  // Do this once, early, so all downstream code can safely write to it.
-  state.handle.change?.((doc: PiConfigDocument) => {
-    if (!doc.knownPeers) doc.knownPeers = {};
-  });
 
   // Attach the change listener BEFORE awaiting whenReady so we don't miss
   // patches, but gate exports on `state.initialSyncReady`. Without the gate,
@@ -1128,114 +1271,36 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     exportKeys(doc, dirty);
   });
 
-  // Wait for the doc to reach "ready" before doing any export work.
-  // - Newly created docs (above) resolve immediately.
-  // - Joining peers resolve once the initial snapshot is loaded.
-  // If the join is interrupted (network drop, peer killed), whenReady
-  // never resolves and nothing gets exported — disk stays clean.
-  try {
-    await state.handle.whenReady?.();
-  } catch (err: any) {
-    notifyActive(`Sync document never became ready: ${err?.message ?? err}`, "error");
-    return;
-  }
-
-  // ── Post-ready: flush buffered peers + wire up doc-known peers ───
-
-  const readyDoc = await state.handle.doc?.();
-
-  // Flush any peer connections that arrived before the doc was ready
-  // into the shared doc.knownPeers roster.
-  if (readyDoc && preReadyPeers.size > 0) {
+  if (docUrl) {
+    // ── Find path: don't block — background continuation ───────────
+    // DocHandle was returned from findWithProgress above. The document
+    // is still loading (WASM deserialization). Defer the knownPeers
+    // migration, whenReady, DNS loop, adapters, and file export to a
+    // background async so the TUI stays responsive.
+    void completeDocSetup(pi, preReadyPeers);
+  } else {
+    // ── Create path: synchronous (fast — no WASM deserialization) ──
     state.handle.change?.((doc: PiConfigDocument) => {
-      for (const host of preReadyPeers) {
-        doc.knownPeers[host] = {
-          lastSeen: Date.now(),
-          addedBy: hostname,
-        };
-      }
-      preReadyPeers.clear();
+      if (!doc.knownPeers) doc.knownPeers = {};
     });
-    // Refresh local mesh roster cache after flushing
-    state.meshPeerHosts = computeMeshPeerHosts(state.config.peers, readyDoc.knownPeers, hostname, state.config.peerAliases);
-  }
-
-  // Dynamically create WebSocketClientAdapters for doc-known peers that
-  // aren't already in the config seed list. This makes the mesh self-
-  // healing: once you've connected to any peer, you learn about the full
-  // roster and connect to everyone on the next startup.
-  if (readyDoc && state.repo?.networkSubsystem) {
-    const existingHosts = new Set(state.config.peers.map((p) => peerHost(p)));
-    for (const host of Object.keys(readyDoc.knownPeers || {})) {
-      if (host === hostname || existingHosts.has(host)) continue;
-      // Skip doc-known hosts that are aliases of a config peer (e.g.
-      // "chris-ms7b85" behind "work") — the config adapter already
-      // covers the same machine and a direct connection would fail.
-      const alias = state.config.peerAliases[host];
-      if (alias && existingHosts.has(alias)) {
-        debugLog(`initRepo: skipping doc-known adapter for ${host} (alias of config peer ${alias})`);
-        continue;
-      }
-      // Pre-flight DNS check: skip hosts that can't resolve at all.
-      // Avoids uncaught ENOTFOUND that the adapter's onError would throw.
-      try {
-        await dns.promises.lookup(host);
-      } catch (dnsErr: any) {
-        debugLog(`initRepo: skipping doc-known adapter for ${host} (DNS: ${dnsErr?.code ?? dnsErr?.message ?? dnsErr})`);
-        continue;
-      }
-      debugLog(`initRepo: creating doc-known adapter for ${host}`);
-      const peer = `${host}:${state.config.port}`;
-      try {
-        const { WebSocketClientAdapter: WSCA } = await import("@automerge/automerge-repo-network-websocket");
-        const adapter = new WSCA(`ws://${peer}`);
-        // Wrap onError and disconnect with the same protection as config
-        // adapters — prevents uncaught exceptions from late DNS failures,
-        // connection resets, etc.
-        const origOnError = (adapter as any).onError;
-        (adapter as any).onError = ((event: any) => {
-          const code = event?.error?.code || event?.code || '?';
-          debugLog(`doc-known onError-wrapped: ${host}, code=${code}`);
-          try { origOnError.call(adapter, event); }
-          catch (err: any) {
-            debugLog(`doc-known onError CAUGHT for ${host}: ${err?.message ?? err}`);
-          }
-        }) as typeof origOnError;
-        const origDisconnect = (adapter as any).disconnect;
-        (adapter as any).disconnect = () => {
-          try { origDisconnect.call(adapter); }
-          catch (err: any) {
-            debugLog(`doc-known disconnect CAUGHT for ${host}: ${err?.message ?? err}`);
-          }
-        };
-        adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => trackPeer(peerId));
-        adapter.on("peer-disconnected", ({ peerId }: { peerId: PeerId }) => untrackPeer(peerId));
-        state.repo.networkSubsystem.addNetworkAdapter(adapter);
-        debugLog(`initRepo: doc-known adapter added for ${host}`);
-      } catch (err: any) {
-        debugLog(`initRepo: failed to create adapter for ${host}: ${err?.message ?? err}`);
-      }
-    }
-  }
-
-  // Push our local files into the doc now that we know the full remote
-  // state, so peers learn about anything we have that they don't.
-  if (readyDoc) {
-    withSuppressedExport(() => {
-      state.handle.change?.((doc: PiConfigDocument) => {
-        importAllFiles(doc);
-        doc.lastSync[hostname] = Date.now();
+    // No whenReady needed for newly created docs — already ready.
+    // But call it for consistency; resolves immediately.
+    await state.handle.whenReady?.();
+    const readyDoc = await state.handle.doc?.();
+    if (readyDoc) {
+      withSuppressedExport(() => {
+        state.handle.change?.((doc: PiConfigDocument) => {
+          importAllFiles(doc);
+          doc.lastSync[hostname] = Date.now();
+        });
       });
-    });
-
-    // One bulk export of the full tree, then mark ready so subsequent
-    // change patches are exported incrementally.
-    if (!isDocEmpty(readyDoc)) {
-      exportAllFiles(readyDoc);
+      if (!isDocEmpty(readyDoc)) {
+        exportAllFiles(readyDoc);
+      }
     }
+    state.initialSyncReady = true;
+    debugLog(`initRepo: COMPLETE — ready for sync (create path)`);
   }
-  state.initialSyncReady = true;
-  debugLog(`initRepo: COMPLETE — ready for sync`);
   } finally {
     state.initInProgress = false;
   }
@@ -1244,6 +1309,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
 async function shutdownRepo() {
   debugLog(`shutdownRepo: START`);
   stopFileWatcher();
+  stopSessionSync();
   stopProbing();
   stopPurgeTimer();
   // renderTimer is owned by the footer (started/stopped via setFooter
@@ -1254,6 +1320,17 @@ async function shutdownRepo() {
   if (state.repo) {
     try { await state.repo.shutdown?.(); } catch {}
   }
+  if (state.httpServer) {
+    state.repo = null;
+    state.handle = null;
+    // Close the shared HTTP server (which stops the WS server too)
+    try { state.httpServer.close(); } catch {}
+    state.httpServer = null;
+    state.wss = null;
+    return;
+  }
+  // Legacy path (standalone wss before we added the http layer)
+  // istanbul ignore next
   if (state.wss) {
     try {
       // state.wss.close() only stops accepting new connections — existing
@@ -1344,8 +1421,113 @@ async function watchAndTakeOver(pi: ExtensionAPI, saveConfig: () => void = () =>
   // Kick off the runtime loops that initRepo normally starts under the
   // non-standby path (watcher, probing, purge).
   startFileWatcher();
+  startSessionSync();
   startPurgeTimer();
   startProbing();
+}
+
+/** Background continuation for the findWithProgress path in initRepo.
+ *  Runs after the TUI is already rendering. Waits for the Automerge
+ *  document to finish loading (WASM deserialization), then completes
+ *  the setup that couldn't run synchronously because the handle wasn't
+ *  ready yet: knownPeers migration, whenReady, DNS/doc-known adapters,
+ *  file import/export. Does NOT block the main thread — the TUI stays
+ *  responsive throughout. */
+async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
+  try {
+    debugLog(`completeDocSetup: START — waiting for document to load...`);
+    await state.handle.whenReady?.();
+    debugLog(`completeDocSetup: whenReady resolved`);
+
+    // Automatically prune stale session data from the CRDT document.
+    // Sessions are now synced over HTTP (not CRDT), so any existing
+    // session entries in the document are inert baggage. Removing them
+    // shrinks the snapshot and speeds up future deserialization.
+    state.handle.change?.((doc: PiConfigDocument) => {
+      if (doc.sessions && Object.keys(doc.sessions).length > 0) {
+        const count = Object.keys(doc.sessions).length;
+        for (const key of Object.keys(doc.sessions)) {
+          delete doc.sessions[key];
+        }
+        debugLog(`completeDocSetup: pruned ${count} stale session entries from CRDT`);
+      }
+    });
+
+    // KnownPeers migration (safe now — handle is ready)
+    state.handle.change?.((doc: PiConfigDocument) => {
+      if (!doc.knownPeers) doc.knownPeers = {};
+    });
+
+    const readyDoc = await state.handle.doc?.();
+
+    // Flush buffered peers into doc.knownPeers
+    if (readyDoc && preReadyPeers.size > 0) {
+      state.handle.change?.((doc: PiConfigDocument) => {
+        for (const host of preReadyPeers) {
+          doc.knownPeers[host] = { lastSeen: Date.now(), addedBy: hostname };
+        }
+        preReadyPeers.clear();
+      });
+      state.meshPeerHosts = computeMeshPeerHosts(
+        state.config.peers, readyDoc.knownPeers, hostname, state.config.peerAliases,
+      );
+    }
+
+    // Doc-known adapters (DNS loop)
+    if (readyDoc && state.repo?.networkSubsystem) {
+      const existingHosts = new Set(state.config.peers.map((p) => peerHost(p)));
+      for (const host of Object.keys(readyDoc.knownPeers || {})) {
+        if (host === hostname || existingHosts.has(host)) continue;
+        const alias = state.config.peerAliases[host];
+        if (alias && existingHosts.has(alias)) {
+          debugLog(`completeDocSetup: skipping doc-known adapter for ${host} (alias of config peer ${alias})`);
+          continue;
+        }
+        try {
+          await Promise.race([
+            dns.promises.lookup(host),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error(`DNS timeout for ${host}`)), 2000),
+            ),
+          ]);
+        } catch (dnsErr: any) {
+          debugLog(`completeDocSetup: skipping doc-known adapter for ${host} (DNS: ${dnsErr?.code ?? dnsErr?.message ?? dnsErr})`);
+          continue;
+        }
+        const { WebSocketClientAdapter: WSCA } = await import("@automerge/automerge-repo-network-websocket");
+        const adapter = new WSCA(`ws://${host}:${state.config.port}`);
+        const origOnError = (adapter as any).onError;
+        (adapter as any).onError = ((event: any) => {
+          try { origOnError.call(adapter, event); } catch {}
+        }) as typeof origOnError;
+        const origDisconnect = (adapter as any).disconnect;
+        (adapter as any).disconnect = () => { try { origDisconnect.call(adapter); } catch {} };
+        adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => {
+          state.wsConnectedPeers.set((peerId as string).replace(/^pi-sync-/, ""), { since: Date.now(), direction: "in" });
+        });
+        state.repo.networkSubsystem.addNetworkAdapter(adapter);
+        debugLog(`completeDocSetup: doc-known adapter added for ${host}`);
+      }
+    }
+
+    // Import local files into doc + export to disk
+    if (readyDoc) {
+      withSuppressedExport(() => {
+        state.handle.change?.((doc: PiConfigDocument) => {
+          importAllFiles(doc);
+          doc.lastSync[hostname] = Date.now();
+        });
+      });
+      if (!isDocEmpty(readyDoc)) {
+        exportAllFiles(readyDoc);
+      }
+    }
+
+    state.initialSyncReady = true;
+    debugLog(`completeDocSetup: COMPLETE — sync is now active`);
+  } catch (err: any) {
+    notifyActive(`Document setup failed: ${err?.message ?? err}`, "error");
+  }
 }
 
 // ── Extension entry point ─────────────────────────────────────────────
@@ -1357,6 +1539,18 @@ export default function (pi: ExtensionAPI) {
     debugLog("pi-sync disabled via env var or flag file");
     return;
   }
+
+  // Pre-warm the heavy Automerge WASM imports at extension load time
+  // (before session_start fires), so Node.js can resolve and cache
+  // them asynchronously. By the time initRepo's await import(...)
+  // runs, the modules are already evaluated and cached, turning the
+  // ~100ms synchronous WASM compilation into ~2ms cache hit.
+  void Promise.all([
+    import("ws"),
+    import("@automerge/automerge-repo"),
+    import("@automerge/automerge-repo-storage-nodefs"),
+    import("@automerge/automerge-repo-network-websocket"),
+  ]).catch(() => {});
 
   state.config = loadConfig();
 
@@ -1994,6 +2188,36 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("sync:prune-sessions", {
+    description: "Remove old session entries from the CRDT document (preserves mesh)",
+    handler: async (_args, ctx) => {
+      if (!state.handle) {
+        ctx.ui.notify("pi-sync not initialized yet", "info");
+        return;
+      }
+      const doc = await state.handle.doc?.();
+      if (!doc) {
+        ctx.ui.notify("Document not ready yet", "info");
+        return;
+      }
+      const sessionKeys = Object.keys(doc.sessions ?? {});
+      if (sessionKeys.length === 0) {
+        ctx.ui.notify("No session data in the CRDT document.", "info");
+        return;
+      }
+      state.handle.change?.((d: PiConfigDocument) => {
+        for (const key of sessionKeys) {
+          delete d.sessions[key];
+        }
+      });
+      ctx.ui.notify(
+        `Pruned ${sessionKeys.length} session entries from the CRDT document. ` +
+        `Peers will sync the deletion. Run /sync:status to confirm.`,
+        "info",
+      );
+    },
+  });
+
   // ── Lifecycle ─────────────────────────────────────────────────────
   // Register these before init so they're always active (even when
   // waiting for takeover).
@@ -2077,8 +2301,14 @@ function startSyncInBackground(pi: ExtensionAPI, saveConfig: () => void = () => 
           debugLog(`Watchdog failed: ${e?.message ?? e}`),
         );
       } else {
+        // initRepo uses findWithProgress for the find-path — the
+        // document handle is returned immediately without blocking.
+        // The synchronous WASM document deserialization runs in a
+        // background continuation (completeDocSetup). The TUI stays
+        // responsive throughout.
         await initRepo(pi, saveConfig);
         startFileWatcher();
+        startSessionSync();
         startPurgeTimer();
         startProbing();
       }

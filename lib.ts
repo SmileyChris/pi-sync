@@ -210,6 +210,8 @@ export function shouldSync(fileKey: string, config: SyncConfig): boolean {
   if (!isSupportedFileKey(fileKey)) return false;
   const subdir = getSubdir(fileKey);
   if (!subdir) return false;
+  // Sessions are synced file-by-file over HTTP, not via Automerge CRDT
+  if (subdir === "sessions") return false;
   return config[SUBDIR_TO_TOGGLE[subdir]] as boolean;
 }
 
