@@ -1515,11 +1515,36 @@ async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
       withSuppressedExport(() => {
         state.handle.change?.((doc: PiConfigDocument) => {
           importAllFiles(doc);
+
+          // Reconcile: tombstone doc entries for files that no longer exist on
+          // disk. This handles the case where files were deleted/moved while
+          // pi-sync was offline or before the watcher's debounce timer had a
+          // chance to commit tombstones — without this, the stale entries get
+          // re-exported on the next restart from local Automerge storage.
+          for (const section of ["extensions", "skills", "prompts"] as const) {
+            const col = doc[section] as Record<string, SyncedFile> | undefined;
+            if (!col) continue;
+            for (const [key, entry] of Object.entries(col)) {
+              if (isTombstone(entry)) continue;
+              if (isLocalOnly(doc, key, hostname)) continue;
+              const absPath = piPathForKey(key);
+              if (absPath && !fs.existsSync(absPath)) {
+                entry.deletedAt = Date.now();
+                entry.deletedBy = hostname;
+              }
+            }
+          }
+
           doc.lastSync[hostname] = Date.now();
         });
       });
-      if (!isDocEmpty(readyDoc)) {
-        exportAllFiles(readyDoc);
+      // Get a fresh doc snapshot — the one captured before the change above is
+      // stale (Automerge returns a snapshot, not a live proxy). Without this,
+      // exportAllFiles would see the pre-reconciliation state and re-export the
+      // very entries we just tombstoned.
+      const reconciledDoc = (await state.handle.doc?.()) ?? readyDoc;
+      if (!isDocEmpty(reconciledDoc)) {
+        exportAllFiles(reconciledDoc);
       }
     }
 
