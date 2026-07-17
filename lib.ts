@@ -391,12 +391,14 @@ export function mergeSettingsIntoDoc(
   existingDoc: Record<string, unknown>,
   fileContent: string,
 ): Record<string, unknown> | null {
-  let parsed: Record<string, unknown>;
+  let parsedValue: unknown;
   try {
-    parsed = JSON.parse(fileContent);
+    parsedValue = JSON.parse(fileContent);
   } catch {
     return null;
   }
+  if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) return null;
+  const parsed = parsedValue as Record<string, unknown>;
 
   const merged = { ...existingDoc };
   let hasDiff = false;
@@ -427,12 +429,14 @@ export function applyJsonMergeInPlace(
   target: Record<string, unknown>,
   fileContent: string,
 ): boolean {
-  let parsed: Record<string, unknown>;
+  let parsedValue: unknown;
   try {
-    parsed = JSON.parse(fileContent);
+    parsedValue = JSON.parse(fileContent);
   } catch {
     return false;
   }
+  if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) return false;
+  const parsed = parsedValue as Record<string, unknown>;
   let changed = false;
   for (const k of Object.keys(target)) {
     if (!(k in parsed)) {
@@ -443,6 +447,30 @@ export function applyJsonMergeInPlace(
   for (const [k, v] of Object.entries(parsed)) {
     if (JSON.stringify(target[k]) !== JSON.stringify(v)) {
       target[k] = v;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** Add only keys that do not already exist in a settings/models subtree.
+ * Used on a first join so the established cluster wins conflicts while a
+ * joining machine may still contribute genuinely new configuration keys. */
+export function applyJsonAdditionsInPlace(
+  target: Record<string, unknown>,
+  fileContent: string,
+): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fileContent);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  let changed = false;
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!(key in target)) {
+      target[key] = value;
       changed = true;
     }
   }

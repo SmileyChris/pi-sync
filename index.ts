@@ -65,6 +65,7 @@ import {
   isLocalOnly,
   shouldSync,
   applyJsonMergeInPlace,
+  applyJsonAdditionsInPlace,
   unwrapContent,
   syncedFileContentMatches,
   loadConfig as loadConfigFromFile,
@@ -376,9 +377,58 @@ function clearDocUrl() {
   } catch {}
 }
 
+type LocalSyncBaseline = {
+  documentUrl: string;
+  trackedKeys: string[];
+  updatedAt: number;
+};
+
+const LOCAL_BASELINE_PATH = path.join(CONFIG_DIR, "local-baseline.json");
+
+function loadLocalBaseline(): LocalSyncBaseline | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(LOCAL_BASELINE_PATH, "utf-8"));
+    if (
+      typeof parsed?.documentUrl !== "string" ||
+      !Array.isArray(parsed?.trackedKeys) ||
+      !parsed.trackedKeys.every((key: unknown) => typeof key === "string")
+    ) return null;
+    return parsed as LocalSyncBaseline;
+  } catch {
+    return null;
+  }
+}
+
+function trackedKeysForHost(doc: PiConfigDocument): string[] {
+  const keys: string[] = [];
+  for (const section of ["extensions", "skills", "prompts"] as const) {
+    for (const [key, entry] of Object.entries(doc[section] ?? {})) {
+      if (
+        !isTombstone(entry) &&
+        shouldSync(key, state.config) &&
+        !isLocalOnly(doc, key, hostname)
+      ) keys.push(key);
+    }
+  }
+  return keys.sort();
+}
+
+function saveLocalBaseline(doc: PiConfigDocument, documentUrl = loadDocUrl()) {
+  if (!documentUrl) return;
+  atomicWriteFile(LOCAL_BASELINE_PATH, JSON.stringify({
+    documentUrl,
+    trackedKeys: trackedKeysForHost(doc),
+    updatedAt: Date.now(),
+  } satisfies LocalSyncBaseline, null, 2) + "\n");
+}
+
 // ── Import: filesystem → document ─────────────────────────────────────
 
-function importFile(doc: PiConfigDocument, fileKey: string): boolean {
+function importFile(
+  doc: PiConfigDocument,
+  fileKey: string,
+  mode: "normal" | "additions-only" = "normal",
+): boolean {
   const key = normalizeFileKey(fileKey);
   if (!key) return false;
   const subdir = getSubdir(key);
@@ -402,13 +452,16 @@ function importFile(doc: PiConfigDocument, fileKey: string): boolean {
   const content = fs.readFileSync(absPath, "utf-8");
 
   if (subdir === "settings" || subdir === "models") {
-    return applyJsonMergeInPlace(doc[subdir], content);
+    return mode === "additions-only"
+      ? applyJsonAdditionsInPlace(doc[subdir], content)
+      : applyJsonMergeInPlace(doc[subdir], content);
   }
 
   // extensions | skills | prompts | sessions
   if (!doc[subdir]) (doc as Record<string, unknown>)[subdir] = {};
   const collection = doc[subdir] as Record<string, SyncedFile>;
   const existing = collection[key];
+  if (mode === "additions-only" && existing) return false;
   if (syncedFileContentMatches(existing, content)) return false;
 
   const entry: SyncedFile = {
@@ -441,17 +494,16 @@ function collectAllFiles(): string[] {
   if (state.config.syncPrompts && fs.existsSync(promptsDir)) {
     files.push(...collectPromptFiles(promptsDir, readEntries));
   }
-  if (state.config.syncSessions && fs.existsSync(SESSIONS_DIR)) {
-    files.push(...collectSessionFiles(SESSIONS_DIR, hostname, readEntries));
-  }
-
   return files;
 }
 
-function importAllFiles(doc: PiConfigDocument): boolean {
+function importAllFiles(
+  doc: PiConfigDocument,
+  mode: "normal" | "additions-only" = "normal",
+): boolean {
   let changed = false;
   for (const fileKey of collectAllFiles()) {
-    if (importFile(doc, fileKey)) changed = true;
+    if (importFile(doc, fileKey, mode)) changed = true;
   }
   return changed;
 }
@@ -1380,7 +1432,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     // is still loading (WASM deserialization). Defer the knownPeers
     // migration, whenReady, DNS loop, adapters, and file export to a
     // background async so the TUI stays responsive.
-    void completeDocSetup(pi, preReadyPeers);
+    void completeDocSetup(pi, preReadyPeers, docUrl);
   } else {
     // ── Create path: synchronous (fast — no WASM deserialization) ──
     state.handle.change?.((doc: PiConfigDocument) => {
@@ -1397,9 +1449,11 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
           doc.lastSync[hostname] = Date.now();
         });
       });
-      if (!isDocEmpty(readyDoc)) {
-        exportAllFiles(readyDoc);
+      const createdDoc = (await state.handle.doc?.()) ?? readyDoc;
+      if (!isDocEmpty(createdDoc)) {
+        exportAllFiles(createdDoc);
       }
+      saveLocalBaseline(createdDoc, state.handle.url);
     }
     state.initialSyncReady = true;
     debugLog(`initRepo: COMPLETE — ready for sync (create path)`);
@@ -1536,7 +1590,11 @@ async function watchAndTakeOver(pi: ExtensionAPI, saveConfig: () => void = () =>
  *  ready yet: knownPeers migration, whenReady, DNS/doc-known adapters,
  *  file import/export. Does NOT block the main thread — the TUI stays
  *  responsive throughout. */
-async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
+async function completeDocSetup(
+  pi: ExtensionAPI,
+  preReadyPeers: Set<string>,
+  documentUrl: string,
+) {
   try {
     debugLog(`completeDocSetup: START — waiting for document to load...`);
     await state.handle.whenReady?.();
@@ -1614,11 +1672,45 @@ async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
       }
     }
 
-    // Import local files into doc + export to disk
+    // A first join contributes only keys the established document does not
+    // already contain. On later starts, the local baseline lets us safely
+    // distinguish offline deletion from a file that never existed here.
     if (readyDoc) {
+      const baseline = loadLocalBaseline();
+      const firstJoin = baseline?.documentUrl !== documentUrl;
+      const reconciliation = firstJoin
+        ? { present: [], deletions: [], blockedDeletions: false }
+        : partitionPendingChanges(
+            baseline.trackedKeys,
+            state.config,
+            readyDoc,
+            (key) => {
+              const absPath = piPathForKey(key);
+              return absPath != null && fs.existsSync(absPath);
+            },
+          );
+
+      if (reconciliation.blockedDeletions) {
+        notifyActive(
+          `Startup mass-delete brake: ${reconciliation.deletions.length} previously tracked files are missing ` +
+          `(limit ${MASS_DELETE_LIMIT}). No startup tombstones were created.`,
+          "warning",
+        );
+      }
+
       withSuppressedExport(() => {
         state.handle.change?.((doc: PiConfigDocument) => {
-          importAllFiles(doc);
+          importAllFiles(doc, firstJoin ? "additions-only" : "normal");
+          if (!reconciliation.blockedDeletions) {
+            for (const key of reconciliation.deletions) {
+              const section = getSubdir(key) as "extensions" | "skills" | "prompts";
+              const entry = (doc[section] as Record<string, SyncedFile>)?.[key];
+              if (entry && !isTombstone(entry)) {
+                entry.deletedAt = Date.now();
+                entry.deletedBy = hostname;
+              }
+            }
+          }
           doc.lastSync[hostname] = Date.now();
         });
       });
@@ -1626,6 +1718,8 @@ async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
       if (!isDocEmpty(mergedDoc)) {
         exportAllFiles(mergedDoc);
       }
+      saveLocalBaseline(mergedDoc, documentUrl);
+      debugLog(`completeDocSetup: ${firstJoin ? "first join" : "restart"} merge completed`);
     }
 
     state.initialSyncReady = true;
@@ -2365,6 +2459,8 @@ export default function (pi: ExtensionAPI) {
               d.lastSync[hostname] = Date.now();
             });
           });
+          const updatedDoc = (await state.handle.doc?.()) ?? doc;
+          saveLocalBaseline(updatedDoc);
         } catch {}
       }
     }

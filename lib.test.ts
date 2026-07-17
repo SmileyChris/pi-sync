@@ -21,6 +21,7 @@ import {
   shouldSync,
   mergeSettingsIntoDoc,
   applyJsonMergeInPlace,
+  applyJsonAdditionsInPlace,
   unwrapContent,
   syncedFileContentMatches,
   loadConfig,
@@ -346,6 +347,10 @@ describe("applyJsonMergeInPlace", () => {
     expect(applyJsonMergeInPlace({}, "not json")).toBe(false);
   });
 
+  it.each(["null", "[]", "42", '"value"'])("rejects non-object JSON %s", (content) => {
+    expect(applyJsonMergeInPlace({ existing: true }, content)).toBe(false);
+  });
+
   it("returns false when content matches", () => {
     expect(applyJsonMergeInPlace({ a: 1 }, '{"a":1}')).toBe(false);
   });
@@ -399,6 +404,27 @@ describe("applyJsonMergeInPlace", () => {
 
     expect((doc as any).models.sonnet).toBeUndefined();
     expect((doc as any).models.opus.id).toBe("claude-opus");
+  });
+});
+
+describe("applyJsonAdditionsInPlace", () => {
+  it("adds missing keys without overwriting established values", () => {
+    const target: Record<string, unknown> = { shared: "cluster" };
+    expect(applyJsonAdditionsInPlace(
+      target,
+      JSON.stringify({ shared: "joiner", local: true }),
+    )).toBe(true);
+    expect(target).toEqual({ shared: "cluster", local: true });
+  });
+
+  it("does not delete keys absent from the joining file", () => {
+    const target: Record<string, unknown> = { keep: true };
+    expect(applyJsonAdditionsInPlace(target, "{}")).toBe(false);
+    expect(target).toEqual({ keep: true });
+  });
+
+  it.each(["not json", "null", "[]"])("rejects invalid settings JSON %s", (content) => {
+    expect(applyJsonAdditionsInPlace({}, content)).toBe(false);
   });
 });
 
