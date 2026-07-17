@@ -652,6 +652,11 @@ async function flushPendingChanges() {
 /** Handle an incoming HTTP POST /session-sync request from a peer.
  *  Writes the session file to disk and suppresses re-broadcast. */
 function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+  if (!state.config.syncSessions) {
+    res.writeHead(403);
+    res.end("Session sync disabled");
+    return;
+  }
   const chunks: Buffer[] = [];
   req.on("data", (c: Buffer) => chunks.push(c));
   req.on("end", () => {
@@ -685,6 +690,10 @@ function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerRes
  *  because they are append-only, hostname-namespaced, and don't need
  *  CRDT merging. */
 function broadcastPendingSessionFiles() {
+  if (!state.config.syncSessions) {
+    state.pendingSessionChanges.clear();
+    return;
+  }
   if (state.pendingSessionChanges.size === 0) return;
   const changes = [...state.pendingSessionChanges];
   state.pendingSessionChanges.clear();
@@ -721,6 +730,11 @@ function broadcastPendingSessionFiles() {
 
 /** Watch for session file changes and broadcast them to peers. */
 function startSessionSync() {
+  if (!state.config.syncSessions) {
+    debugLog(`session-sync: disabled by config`);
+    return;
+  }
+  if (state.sessionWatcher) return;
   if (state.config.peers.length === 0) {
     debugLog(`session-sync: no peers, skipping session sync`);
     return;
@@ -1515,36 +1529,12 @@ async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
       withSuppressedExport(() => {
         state.handle.change?.((doc: PiConfigDocument) => {
           importAllFiles(doc);
-
-          // Reconcile: tombstone doc entries for files that no longer exist on
-          // disk. This handles the case where files were deleted/moved while
-          // pi-sync was offline or before the watcher's debounce timer had a
-          // chance to commit tombstones — without this, the stale entries get
-          // re-exported on the next restart from local Automerge storage.
-          for (const section of ["extensions", "skills", "prompts"] as const) {
-            const col = doc[section] as Record<string, SyncedFile> | undefined;
-            if (!col) continue;
-            for (const [key, entry] of Object.entries(col)) {
-              if (isTombstone(entry)) continue;
-              if (isLocalOnly(doc, key, hostname)) continue;
-              const absPath = piPathForKey(key);
-              if (absPath && !fs.existsSync(absPath)) {
-                entry.deletedAt = Date.now();
-                entry.deletedBy = hostname;
-              }
-            }
-          }
-
           doc.lastSync[hostname] = Date.now();
         });
       });
-      // Get a fresh doc snapshot — the one captured before the change above is
-      // stale (Automerge returns a snapshot, not a live proxy). Without this,
-      // exportAllFiles would see the pre-reconciliation state and re-export the
-      // very entries we just tombstoned.
-      const reconciledDoc = (await state.handle.doc?.()) ?? readyDoc;
-      if (!isDocEmpty(reconciledDoc)) {
-        exportAllFiles(reconciledDoc);
+      const mergedDoc = (await state.handle.doc?.()) ?? readyDoc;
+      if (!isDocEmpty(mergedDoc)) {
+        exportAllFiles(mergedDoc);
       }
     }
 
@@ -1916,6 +1906,7 @@ export default function (pi: ExtensionAPI) {
         { id: "syncExtensions", label: "Extensions", currentValue: state.config.syncExtensions ? "on" : "off", values: ["on", "off"] },
         { id: "syncSkills", label: "Skills", currentValue: state.config.syncSkills ? "on" : "off", values: ["on", "off"] },
         { id: "syncPrompts", label: "Prompts", currentValue: state.config.syncPrompts ? "on" : "off", values: ["on", "off"] },
+        { id: "syncSessions", label: "Sessions", currentValue: state.config.syncSessions ? "on" : "off", values: ["on", "off"] },
       ];
 
       await ctx.ui.custom((tui, theme, _kb, done) => {
@@ -1931,9 +1922,13 @@ export default function (pi: ExtensionAPI) {
           (id, newValue) => {
             // Only the boolean sync* toggles are exposed in buildItems();
             // port/peers aren't reachable from this panel.
-            const key = id as "syncSettings" | "syncExtensions" | "syncSkills" | "syncModels" | "syncPrompts";
+            const key = id as "syncSettings" | "syncExtensions" | "syncSkills" | "syncModels" | "syncPrompts" | "syncSessions";
             state.config[key] = (newValue === "on");
             saveConfig();
+            if (key === "syncSessions") {
+              if (state.config.syncSessions) startSessionSync();
+              else stopSessionSync();
+            }
             // Update the list item in-place
             settingsList.updateValue(id, newValue);
           },
@@ -2039,6 +2034,7 @@ export default function (pi: ExtensionAPI) {
         await initRepo(pi, saveConfig);
         // After fresh init, restart runtime loops stopped during unlink.
         startFileWatcher();
+        startSessionSync();
         startPurgeTimer();
         startProbing();
         ctx.ui.notify(

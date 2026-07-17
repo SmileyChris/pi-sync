@@ -246,11 +246,14 @@ describe("shouldSync", () => {
     ["extensions/foo/index.ts", "syncExtensions"],
     ["skills/foo/SKILL.md", "syncSkills"],
     ["prompts/foo.md", "syncPrompts"],
-    ["sessions/foo.jsonl", "syncSessions"],
   ] as const)("respects %s toggle via %s", (key, toggle) => {
     expect(shouldSync(key, DEFAULT_SYNC_CONFIG)).toBe(true);
     expect(shouldSync(key, allOff)).toBe(false);
     expect(shouldSync(key, { ...allOff, [toggle]: true })).toBe(true);
+  });
+
+  it("excludes sessions from CRDT sync", () => {
+    expect(shouldSync("sessions/foo.jsonl", DEFAULT_SYNC_CONFIG)).toBe(false);
   });
 
   it("returns false for unknown subdir", () => {
