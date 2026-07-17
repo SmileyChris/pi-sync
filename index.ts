@@ -74,6 +74,8 @@ import {
   collectSkillFiles,
   collectPromptFiles,
   collectSessionFiles,
+  sessionKeyForLocalRelative,
+  validateIncomingSessionKey,
   SESSIONS_DIR,
   dirtyKeysFromPatches,
   isDocEmpty,
@@ -649,6 +651,41 @@ async function flushPendingChanges() {
 
 // ── Session file sync (non-CRDT) ────────────────────────────────────
 
+const MAX_SESSION_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_SESSION_BODY_BYTES = 64 * 1024 * 1024;
+const SESSION_RETRY_MS = 15_000;
+
+function sessionPeerAddresses(): string[] {
+  const byHost = new Map<string, string>();
+  for (const peer of state.config.peers) {
+    const parsed = parsePeer(peer);
+    if (parsed && parsed.host !== hostname) byHost.set(parsed.host, peer);
+  }
+  for (const host of state.meshPeerHosts) {
+    if (host !== hostname && !byHost.has(host)) {
+      byHost.set(host, `${host}:${state.config.port}`);
+    }
+  }
+  return [...byHost.values()];
+}
+
+function scheduleSessionBroadcast(delayMs = 2000) {
+  if (!state.config.syncSessions || state.sessionSyncTimer) return;
+  state.sessionSyncTimer = setTimeout(() => {
+    state.sessionSyncTimer = null;
+    void broadcastPendingSessionFiles();
+  }, delayMs);
+  (state.sessionSyncTimer as any).unref?.();
+}
+
+function queueAllLocalSessionFiles() {
+  if (!state.config.syncSessions || !fs.existsSync(SESSIONS_DIR)) return;
+  for (const key of collectSessionFiles(SESSIONS_DIR, hostname, readEntries)) {
+    state.pendingSessionChanges.add(key);
+  }
+  if (state.pendingSessionChanges.size > 0) scheduleSessionBroadcast(250);
+}
+
 /** Handle an incoming HTTP POST /session-sync request from a peer.
  *  Writes the session file to disk and suppresses re-broadcast. */
 function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -658,22 +695,48 @@ function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerRes
     return;
   }
   const chunks: Buffer[] = [];
-  req.on("data", (c: Buffer) => chunks.push(c));
+  let receivedBytes = 0;
+  let rejected = false;
+  req.on("data", (c: Buffer) => {
+    receivedBytes += c.length;
+    if (receivedBytes > MAX_SESSION_BODY_BYTES) {
+      if (!rejected) {
+        rejected = true;
+        res.writeHead(413);
+        res.end("Session payload too large");
+      }
+      return;
+    }
+    chunks.push(c);
+  });
   req.on("end", () => {
+    if (rejected) return;
     try {
       const body = JSON.parse(Buffer.concat(chunks).toString());
-      const key = normalizeFileKey(body.key);
-      if (!key || !key.startsWith("sessions/")) {
+      if (typeof body?.key !== "string" || typeof body?.content !== "string") {
+        res.writeHead(400);
+        res.end("Invalid payload");
+        return;
+      }
+      const key = validateIncomingSessionKey(body.key, hostname);
+      if (!key) {
         res.writeHead(400);
         res.end("Invalid key");
         return;
       }
+      if (Buffer.byteLength(body.content, "utf-8") > MAX_SESSION_FILE_BYTES) {
+        res.writeHead(413);
+        res.end("Session file too large");
+        return;
+      }
       const absPath = piPathForKey(key);
       if (!absPath) { res.writeHead(400); res.end(); return; }
-      ensureDir(path.dirname(absPath));
-      state.receivingSessionFile = true;
-      try { fs.writeFileSync(absPath, body.content, "utf-8"); }
-      finally { state.receivingSessionFile = false; }
+      if (readFileOrEmpty(absPath) === body.content) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      atomicWriteFile(absPath, body.content);
       debugLog(`session-sync: received ${key}`);
       res.writeHead(200);
       res.end("ok");
@@ -685,46 +748,77 @@ function handleSessionSyncRequest(req: http.IncomingMessage, res: http.ServerRes
   });
 }
 
+async function postSessionFile(peer: string, key: string, content: string): Promise<boolean> {
+  const body = JSON.stringify({ key, content });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    let request: http.ClientRequest;
+    try {
+      request = http.request(`http://${peer}/session-sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      }, (response) => {
+        response.resume();
+        finish((response.statusCode ?? 500) >= 200 && (response.statusCode ?? 500) < 300);
+      });
+    } catch {
+      return finish(false);
+    }
+    request.setTimeout(5000, () => request.destroy(new Error("session sync timeout")));
+    request.once("error", () => finish(false));
+    request.end(body);
+  });
+}
+
 /** Collect pending session changes and POST them to connected peers.
  *  Session files are sync'd file-by-file over HTTP (not Automerge)
  *  because they are append-only, hostname-namespaced, and don't need
  *  CRDT merging. */
-function broadcastPendingSessionFiles() {
+async function broadcastPendingSessionFiles() {
   if (!state.config.syncSessions) {
     state.pendingSessionChanges.clear();
     return;
   }
+  if (state.sessionBroadcastRunning) {
+    scheduleSessionBroadcast();
+    return;
+  }
   if (state.pendingSessionChanges.size === 0) return;
+  state.sessionBroadcastRunning = true;
   const changes = [...state.pendingSessionChanges];
   state.pendingSessionChanges.clear();
 
-  for (const peer of state.config.peers) {
-    const ph = peerHost(peer);
-    if (ph === hostname) continue;
-    const peerUrl = `http://${peer}/session-sync`;
+  try {
+    const peers = sessionPeerAddresses();
     for (const key of changes) {
-      const absPath = piPathForKey(key);
+      const absPath = sessionImportPath(key);
       if (!absPath) continue;
       let content: string;
-      try { content = fs.readFileSync(absPath, "utf-8"); }
-      catch { continue; }
-      const body = JSON.stringify({ key, content });
-      // Fire-and-forget POST — don't block on peer connectivity
-      void (async () => {
-        try {
-          const { request } = await import("node:http");
-          await new Promise<void>((resolve, reject) => {
-            const r = request(peerUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-            }, (res) => { res.resume(); resolve(); });
-            r.on("error", reject);
-            r.write(body);
-            r.end();
-          });
-        } catch { /* peer unreachable — try next time */ }
-      })();
+      try {
+        const stat = fs.statSync(absPath);
+        if (!stat.isFile() || stat.size > MAX_SESSION_FILE_BYTES) continue;
+        content = fs.readFileSync(absPath, "utf-8");
+      } catch {
+        continue;
+      }
+      if (peers.length === 0) {
+        state.pendingSessionChanges.add(key);
+        continue;
+      }
+      const results = await Promise.all(peers.map((peer) => postSessionFile(peer, key, content)));
+      if (results.some((ok) => !ok)) state.pendingSessionChanges.add(key);
     }
+  } finally {
+    state.sessionBroadcastRunning = false;
+    if (state.pendingSessionChanges.size > 0) scheduleSessionBroadcast(SESSION_RETRY_MS);
   }
 }
 
@@ -735,24 +829,18 @@ function startSessionSync() {
     return;
   }
   if (state.sessionWatcher) return;
-  if (state.config.peers.length === 0) {
-    debugLog(`session-sync: no peers, skipping session sync`);
-    return;
-  }
   try {
     const sessionsDir = path.join(PI_DIR, "sessions");
-    if (!fs.existsSync(sessionsDir)) return;
+    ensureDir(sessionsDir);
     state.sessionWatcher = fs.watch(sessionsDir, { recursive: true }, (_eventType, filename) => {
-      if (!filename || !filename.endsWith(".jsonl")) return;
-      const key = normalizeFileKey(`sessions/${filename}`);
+      if (typeof filename !== "string") return;
+      const key = sessionKeyForLocalRelative(filename, hostname);
       if (!key) return;
-      // Skip if we just wrote this file from a peer broadcast
-      if (state.receivingSessionFile) return;
       state.pendingSessionChanges.add(key);
-      if (state.sessionSyncTimer) clearTimeout(state.sessionSyncTimer);
-      state.sessionSyncTimer = setTimeout(broadcastPendingSessionFiles, 2000);
+      scheduleSessionBroadcast();
     });
     debugLog(`session-sync: watcher started on ${sessionsDir}`);
+    queueAllLocalSessionFiles();
   } catch (err) {
     debugLog(`session-sync: watcher failed: ${err}`);
   }
@@ -762,7 +850,7 @@ function stopSessionSync() {
   if (state.sessionSyncTimer) { clearTimeout(state.sessionSyncTimer); state.sessionSyncTimer = null; }
   if (state.sessionWatcher) { state.sessionWatcher.close(); state.sessionWatcher = null; }
   state.pendingSessionChanges.clear();
-  state.sessionSyncSockets.clear();
+  state.sessionBroadcastRunning = false;
 }
 
 function startFileWatcher() {
@@ -1117,6 +1205,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     // Add to meshPeerHosts synchronously so the footer updates immediately.
     // The change listener will recompute the full set when the doc write lands.
     state.meshPeerHosts.add(host);
+    scheduleSessionBroadcast(100);
     // Record alias if the real host differs from the config peer name.
     // This lets us skip duplicate doc-known adapters on future reloads.
     if (configPeerName && host !== configPeerName) {
@@ -1518,6 +1607,7 @@ async function completeDocSetup(pi: ExtensionAPI, preReadyPeers: Set<string>) {
         (adapter as any).disconnect = () => { try { origDisconnect.call(adapter); } catch {} };
         adapter.on("peer-candidate", ({ peerId }: { peerId: PeerId }) => {
           state.wsConnectedPeers.set((peerId as string).replace(/^pi-sync-/, ""), { since: Date.now(), direction: "in" });
+          scheduleSessionBroadcast(100);
         });
         state.repo.networkSubsystem.addNetworkAdapter(adapter);
         debugLog(`completeDocSetup: doc-known adapter added for ${host}`);

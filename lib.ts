@@ -321,6 +321,42 @@ export function collectSessionFiles(
   return results;
 }
 
+/** Convert a native pi session path (relative to sessions/) into the
+ * hostname-namespaced key used by the HTTP session transport. Only pi's
+ * native `--cwd--/...jsonl` tree is eligible; already-synced hostname
+ * directories are deliberately rejected to prevent echo loops. */
+export function sessionKeyForLocalRelative(
+  relativePath: string,
+  sourceHostname: string,
+): string | null {
+  if (!/^[A-Za-z0-9._-]+$/.test(sourceHostname)) return null;
+  const relative = normalizeFileKey(relativePath);
+  if (!relative || !relative.endsWith(".jsonl")) return null;
+  const parts = relative.split("/");
+  if (parts.length < 2 || !parts[0].startsWith("--")) return null;
+  return normalizeFileKey(`sessions/${sourceHostname}/${relative}`);
+}
+
+/** Validate an incoming namespaced session key. Returns the normalized key
+ * that may be written below PI_DIR, or null when the key is malformed, points
+ * at our own hostname, or does not target a native pi session subtree. */
+export function validateIncomingSessionKey(
+  rawKey: string,
+  localHostname: string,
+): string | null {
+  const key = normalizeFileKey(rawKey);
+  if (!key || !key.endsWith(".jsonl")) return null;
+  const parts = key.split("/");
+  if (parts.length < 4 || parts[0] !== "sessions") return null;
+  const sourceHostname = parts[1];
+  if (
+    !/^[A-Za-z0-9._-]+$/.test(sourceHostname) ||
+    sourceHostname === localHostname ||
+    !parts[2].startsWith("--")
+  ) return null;
+  return key;
+}
+
 function walkSessionDir(
   dir: string,
   relPrefix: string,

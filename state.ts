@@ -31,14 +31,12 @@ export type SyncState = {
   wss: any;
   httpServer: http.Server | null;
   watcher: fs.FSWatcher | null;
-  /** WebSocket client sockets connected for session file sync. */
-  sessionSyncSockets: Set<any>;
   /** Debounce timer for batching session file broadcasts. */
   sessionSyncTimer: ReturnType<typeof setTimeout> | null;
   /** Keys of session files that changed since last broadcast. */
   pendingSessionChanges: Set<string>;
-  /** True while writing a received session file (suppress re-broadcast). */
-  receivingSessionFile: boolean;
+  /** Prevent overlapping HTTP session broadcast batches. */
+  sessionBroadcastRunning: boolean;
   /** fs.Watcher for session files (non-CRDT sync). */
   sessionWatcher: fs.FSWatcher | null;
   ImmutableString: any;
@@ -88,10 +86,9 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
   wss: null,
   httpServer: null,
   watcher: null,
-  sessionSyncSockets: new Set(),
   sessionSyncTimer: null,
   pendingSessionChanges: new Set(),
-  receivingSessionFile: false,
+  sessionBroadcastRunning: false,
   sessionWatcher: null,
   ImmutableString: null,
   wsConnectedPeers: new Map(),
@@ -117,3 +114,7 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
   peersAtInit: [],
   meshPeerHosts: new Set(),
 })); // not sealed — allows schema migration across reloads
+
+// The singleton survives jiti reloads, so initialize fields introduced by a
+// newer extension version when an older state object is already resident.
+state.sessionBroadcastRunning ??= false;

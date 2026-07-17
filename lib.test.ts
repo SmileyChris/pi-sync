@@ -30,6 +30,8 @@ import {
   collectSkillFiles,
   collectPromptFiles,
   collectSessionFiles,
+  sessionKeyForLocalRelative,
+  validateIncomingSessionKey,
   dirtyKeysFromPatches,
   isDocEmpty,
   isTombstone,
@@ -1003,5 +1005,41 @@ describe("collectSessionFiles", () => {
     expect(result).not.toContain("notes.txt");
     // Top-level orphan .jsonl (not under --...-- dir) is skipped
     expect(result).not.toContain("orphan.jsonl");
+  });
+});
+
+describe("session transport keys", () => {
+  it("namespaces native session paths by source hostname", () => {
+    expect(sessionKeyForLocalRelative(
+      "--home-chris--/session.jsonl",
+      "laptop",
+    )).toBe("sessions/laptop/--home-chris--/session.jsonl");
+  });
+
+  it.each([
+    "remote-host/session.jsonl",
+    "orphan.jsonl",
+    "--home-chris--/notes.txt",
+    "--home-chris--/../escape.jsonl",
+  ])("rejects non-native outbound path %s", (relative) => {
+    expect(sessionKeyForLocalRelative(relative, "laptop")).toBeNull();
+  });
+
+  it("accepts a remote hostname-namespaced session key", () => {
+    expect(validateIncomingSessionKey(
+      "sessions/desktop/--home-chris--/session.jsonl",
+      "laptop",
+    )).toBe("sessions/desktop/--home-chris--/session.jsonl");
+  });
+
+  it.each([
+    "sessions/laptop/--home-chris--/session.jsonl",
+    "sessions/desktop/session.jsonl",
+    "sessions/desktop/not-native/session.jsonl",
+    "sessions/desktop/--home--/notes.txt",
+    "sessions/desktop/--home--/../escape.jsonl",
+    "/sessions/desktop/--home--/session.jsonl",
+  ])("rejects unsafe or echo-prone incoming key %s", (key) => {
+    expect(validateIncomingSessionKey(key, "laptop")).toBeNull();
   });
 });
