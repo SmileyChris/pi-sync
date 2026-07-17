@@ -26,6 +26,7 @@ import {
   unwrapContent,
   syncedFileContentMatches,
   loadConfig,
+  createDefaultSyncConfig,
   parsePeer,
   peerHost,
   collectExtensionFiles,
@@ -507,6 +508,34 @@ describe("loadConfig", () => {
     expect(cfg).toEqual(DEFAULT_SYNC_CONFIG);
   });
 
+  it("rejects invalid field types and malformed peers", () => {
+    const cfg = loadConfig(
+      "/fake",
+      () => true,
+      () => JSON.stringify({
+        port: 99999,
+        peers: ["valid:3030", "missing-port", 42, "valid:3030"],
+        peerAliases: { laptop: "tailnet-name", bad: 42 },
+        syncSkills: "no",
+        syncSessions: false,
+      }),
+    );
+    expect(cfg.port).toBe(DEFAULT_SYNC_CONFIG.port);
+    expect(cfg.peers).toEqual(["valid:3030"]);
+    expect(cfg.peerAliases).toEqual({ laptop: "tailnet-name" });
+    expect(cfg.syncSkills).toBe(true);
+    expect(cfg.syncSessions).toBe(false);
+  });
+
+  it("returns independent peer collections", () => {
+    const first = createDefaultSyncConfig();
+    const second = createDefaultSyncConfig();
+    first.peers.push("host:3030");
+    first.peerAliases.real = "alias";
+    expect(second.peers).toEqual([]);
+    expect(second.peerAliases).toEqual({});
+  });
+
   it("overrides all toggles", () => {
     const cfg = loadConfig(
       "/fake",
@@ -543,11 +572,15 @@ describe("parsePeer", () => {
     expect(parsePeer("192.168.1.5:4040")).toEqual({ host: "192.168.1.5", port: 4040 });
   });
 
+  it("parses bracketed IPv6:port for socket use", () => {
+    expect(parsePeer("[::1]:3030")).toEqual({ host: "::1", port: 3030 });
+  });
+
   it("returns null when input has no colon", () => {
     expect(parsePeer("justahostname")).toBeNull();
   });
 
-  it.each(["host:abc", "host:0", "host:99999"])("rejects invalid port %s", (s) => {
+  it.each(["host:abc", "host:0", "host:99999", "host:3030junk", "bad host:3030"])("rejects invalid peer %s", (s) => {
     expect(parsePeer(s)).toBeNull();
   });
 

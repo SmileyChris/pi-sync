@@ -1,8 +1,8 @@
 # AGENTS.md — pi-sync
 
-pi-sync is a P2P sync extension for the pi coding agent. It uses Automerge CRDTs over
-WebSocket (typically Tailscale) to keep pi settings, extensions, skills, models,
-prompts, and session history in sync across machines.
+pi-sync is a P2P sync extension for the pi coding agent. It uses Automerge CRDTs
+over WebSocket for configuration and a bounded HTTP channel for session history
+(typically over Tailscale).
 
 For the canonical protocol reference, identity model, and trust assumptions, see
 **[PROTOCOL.md](./PROTOCOL.md)**.
@@ -79,6 +79,16 @@ extensions/pi-sync/
     affected fileKeys from the patch list and only exports those keys, rather than
     re-exporting the entire document on every change.
 
+12. **Sessions use the bounded HTTP channel, not Automerge.** Only native
+    `sessions/--cwd--/**/*.jsonl` files are sent, under keys namespaced by the
+    source hostname. Both sender and receiver must honor `syncSessions`; never
+    rebroadcast hostname directories.
+
+13. **First join is cluster-wins.** A joining host may contribute missing keys,
+    but must not overwrite established document values. Startup deletion
+    reconciliation requires a matching local baseline and must use the same
+    mass-delete brake as watcher deletions.
+
 ## Testing
 
 Run tests with:
@@ -94,15 +104,16 @@ npx vitest            # watch mode
 |---|---|
 | `normalizeFileKey`, `isPiSyncExtensionKey` | Path safety, reject `..`/null bytes/absolute paths |
 | `fileKey`, `getSubdir` | Path mapping, Windows separators |
-| `isLocalOnlyByMap`, `isLocalOnly` | Local-only filtering, prefix/longest-match resolution |
+| `localOnlyHostsForKey`, `isLocalOnlyByMap`, `isLocalOnly` | Local-only filtering, prefix/longest-match resolution |
 | `shouldSync` | Config toggle gating, pi-sync self-exclusion |
-| `mergeSettingsIntoDoc` | JSON merge, key removal, immutability |
+| `mergeSettingsIntoDoc`, `applyJsonMergeInPlace`, `applyJsonAdditionsInPlace` | Normal and first-join JSON merge |
 | `unwrapContent`, `syncedFileContentMatches` | Content extraction (ImmutableString-safe) |
 | `isTombstone`, `isPastTTL` | Soft-delete lifecycle, 14-day TTL |
 | `loadConfig` | Config parsing, corrupt JSON fallback |
 | `parsePeer`, `peerHost` | Peer string parsing, host extraction |
 | `dirtyKeysFromPatches` | Patch → fileKey mapping, unsafe-key rejection |
 | `collectExtensionFiles/SkillFiles/PromptFiles` | Directory walking, skip rules |
+| `sessionKeyForLocalRelative`, `validateIncomingSessionKey` | Session namespacing and echo/path rejection |
 
 When adding new logic, prefer to put it in `lib.ts` and add tests.
 

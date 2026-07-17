@@ -25,3 +25,14 @@ These are the project's rules of the road for contributors. The order is not str
 10. **Path safety.** Always normalize fileKeys through `normalizeFileKey()` before filesystem operations. It rejects absolute paths, `..` traversal, null bytes, and other unsafe inputs. Use `piPathForKey()` / `trashPathForKey()` to derive absolute filesystem paths safely.
 
 11. **Smart exports via `dirtyKeysFromPatches`.** The change listener extracts affected fileKeys from the patch list and only exports those keys, rather than re-exporting the entire document on every change.
+
+12. **Sessions use HTTP, not Automerge.** Only native `--cwd--` JSONL files are
+sent, keys include the source hostname, and both directions honor
+`syncSessions`. Hostname directories must never be rebroadcast.
+
+13. **First join is cluster-wins.** Joining hosts contribute only missing keys.
+Offline startup deletions require a matching local baseline and must pass the
+mass-delete brake.
+
+14. **Process-wide network patches are idempotent.** Tag prototype wrappers
+with `Symbol.for(...)` so jiti reloads cannot stack them.

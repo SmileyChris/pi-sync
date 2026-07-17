@@ -12,7 +12,7 @@ import type * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { type SyncConfig, DEFAULT_SYNC_CONFIG } from "./lib";
+import { type SyncConfig, createDefaultSyncConfig } from "./lib";
 
 // ── Constants ─────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ const STATE_KEY = Symbol.for("pi-sync:state");
 type StateHost = typeof globalThis & { [STATE_KEY]?: SyncState };
 
 export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
-  config: { ...DEFAULT_SYNC_CONFIG },
+  config: createDefaultSyncConfig(),
   repo: null,
   handle: null,
   wss: null,

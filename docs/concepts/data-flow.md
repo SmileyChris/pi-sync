@@ -17,3 +17,15 @@ The loop:
 5. **Guard.** While exporting, an `exporting` flag (and a `suppressExportDepth` counter for nested calls) suppresses the watcher so the just-written file is not re-imported.
 
 For why imports do per-key merges into `settings.json` / `models.json` rather than whole-file replacement, see [CRDT model](crdt-model.md).
+
+Session files follow a separate loop:
+
+```
+native --cwd--/*.jsonl → debounced queue → POST /session-sync
+                                              │
+                         sessions/<source-host>/--cwd--/*.jsonl
+```
+
+The sender retries failed deliveries and queues all native sessions on startup.
+The receiver validates hostname-namespaced keys, limits request/file size,
+atomically writes changed content, and ignores identical content.

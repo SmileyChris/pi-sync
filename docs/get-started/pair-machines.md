@@ -38,7 +38,9 @@ On the new machine:
 /reload
 ```
 
-After reload, synced extensions, skills, settings, models, and prompts from the first machine will appear on the second. Changes propagate both ways automatically.
+After reload, established cluster values win conflicts and appear on the second
+machine. Files and JSON keys unique to the joiner are contributed to the
+cluster. Changes then propagate both ways automatically.
 
 ## See also
 

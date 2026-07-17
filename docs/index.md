@@ -1,6 +1,9 @@
 # pi-sync
 
-P2P sync for pi coding agent settings using [Automerge](https://automerge.org/) CRDTs over WebSocket — typically run across machines on the same [Tailscale](https://tailscale.com/) tailnet. No central server required; each peer runs a lightweight WS server and connects to every other peer. Works offline and merges automatically when reconnected.
+P2P sync for pi coding agent settings using [Automerge](https://automerge.org/)
+CRDTs over WebSocket, plus a bounded HTTP channel for session history—typically
+run across machines on the same [Tailscale](https://tailscale.com/) tailnet. No
+central server is required.
 
 ## What gets synced
 
@@ -11,6 +14,7 @@ P2P sync for pi coding agent settings using [Automerge](https://automerge.org/) 
 | Extensions | `syncExtensions`   | `~/.pi/agent/extensions/*` (code + assets, except pi-sync) |
 | Skills     | `syncSkills`       | `~/.pi/agent/skills/**/*.md`                           |
 | Prompts    | `syncPrompts`      | `~/.pi/agent/prompts/**/*.md`, `**/*.txt`              |
+| Sessions   | `syncSessions`     | Native `~/.pi/agent/sessions/--cwd--/**/*.jsonl` via HTTP |
 
 The `pi-sync` extension itself is **never** synced — it is skipped by file collection and `shouldSync` gating, and its entries in the Automerge document are pinned to `localOnly` on creation because its WASM binaries and peer config are machine-specific.
 

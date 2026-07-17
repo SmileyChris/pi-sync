@@ -44,7 +44,9 @@ List files and prefixes pinned as local-only.
 
 ## `/sync:local-only add <path> [host]`
 
-Pin a path to one allowed host (defaults to the current machine).
+Pin an extension, skill, or prompt path to one allowed host (defaults to the
+current machine). Live content is removed from the shared document and
+disallowed copies move to trash.
 
 ## `/sync:local-only remove <path>`
 

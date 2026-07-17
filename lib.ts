@@ -68,6 +68,14 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   syncSessions: true,
 };
 
+export function createDefaultSyncConfig(): SyncConfig {
+  return {
+    ...DEFAULT_SYNC_CONFIG,
+    peers: [],
+    peerAliases: {},
+  };
+}
+
 // ── Path constants ───────────────────────────────────────────────────
 
 const home = os.homedir();
@@ -521,15 +529,43 @@ export function loadConfig(
   existsSync: (p: string) => boolean,
   readFileSync: (p: string, encoding: string) => string,
 ): SyncConfig {
+  const defaults = createDefaultSyncConfig();
   try {
     if (existsSync(configPath)) {
       const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-      return { ...DEFAULT_SYNC_CONFIG, ...raw };
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return defaults;
+      const config = { ...defaults };
+      if (Number.isInteger(raw.port) && raw.port >= 1 && raw.port <= 65535) {
+        config.port = raw.port;
+      }
+      if (Array.isArray(raw.peers)) {
+        config.peers = [...new Set(raw.peers.filter(
+          (peer: unknown): peer is string => typeof peer === "string" && parsePeer(peer) !== null,
+        ))];
+      }
+      if (raw.peerAliases && typeof raw.peerAliases === "object" && !Array.isArray(raw.peerAliases)) {
+        config.peerAliases = Object.fromEntries(
+          Object.entries(raw.peerAliases).filter(
+            ([host, alias]) => host.length > 0 && typeof alias === "string" && alias.length > 0,
+          ),
+        ) as Record<string, string>;
+      }
+      for (const key of [
+        "syncSettings",
+        "syncExtensions",
+        "syncSkills",
+        "syncModels",
+        "syncPrompts",
+        "syncSessions",
+      ] as const) {
+        if (typeof raw[key] === "boolean") config[key] = raw[key];
+      }
+      return config;
     }
   } catch {
     /* corrupt config → fall through to defaults */
   }
-  return { ...DEFAULT_SYNC_CONFIG };
+  return defaults;
 }
 
 // ── Patch helpers ────────────────────────────────────────────────────
@@ -691,9 +727,14 @@ export function effectivePeers(
 export function parsePeer(peer: string): { host: string; port: number } | null {
   const idx = peer.lastIndexOf(":");
   if (idx === -1) return null;
-  const host = peer.slice(0, idx);
-  const port = parseInt(peer.slice(idx + 1), 10);
-  if (!host || isNaN(port) || port < 1 || port > 65535) return null;
+  const rawHost = peer.slice(0, idx);
+  const host = rawHost.startsWith("[") && rawHost.endsWith("]")
+    ? rawHost.slice(1, -1)
+    : rawHost;
+  const portText = peer.slice(idx + 1);
+  if (!host || rawHost.trim() !== rawHost || /\s/.test(rawHost) || !/^\d+$/.test(portText)) return null;
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   return { host, port };
 }
 

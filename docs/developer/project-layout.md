@@ -7,6 +7,8 @@ extensions/pi-sync/
 ├── footer.ts         # Custom 2-line TUI footer (sync widget + token stats)
 ├── lib.ts            # Pure functions & types, testable without Automerge/WASM
 ├── lib.test.ts       # Unit tests for lib.ts (vitest)
+├── ws-patch.test.ts  # WebSocket close regression tests
+├── reconnect-patch.test.ts # Reconnect/socket patch regression tests
 ├── types.ts          # TypeScript interfaces (re-export / documentation)
 ├── package.json      # Dependencies: @automerge/*, ws, vitest
 ├── zensical.toml     # Documentation site config

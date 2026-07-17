@@ -51,10 +51,14 @@
 - **Description:** Sync `~/.pi/agent/sessions/**/*.jsonl` (session history).
 Files are keyed by source hostname so remote sessions land under
 `sessions/{hostname}/` — clearly distinguishable from local sessions
-and automatically indexed by pi-session-search.
+and automatically indexed by pi-session-search. Session files use the HTTP
+session channel rather than the Automerge document. Setting this to `false`
+disables both sending and accepting session payloads.
 
 ## Other files in `~/.config/pi-sync/`
 
 | File | Purpose |
 |---|---|
 | `doc-url` | Automerge document URL (join key). Written on `/sync:import` or first-machine doc creation. |
+| `local-baseline.json` | Document URL and file keys previously materialized on this host; used for safe startup deletion detection. |
+| `disabled` | Presence disables the extension. |

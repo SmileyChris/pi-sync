@@ -1,6 +1,9 @@
 # CRDT model
 
-pi-sync uses [Automerge](https://automerge.org/) as its CRDT layer. A single Automerge document holds all synced state for the cluster.
+pi-sync uses [Automerge](https://automerge.org/) as its configuration CRDT
+layer. A single document holds settings, models, extension/skill/prompt files,
+mesh metadata, and local-only rules. Session JSONL payloads use the separate
+HTTP session channel and are not retained in the document.
 
 ## ImmutableString unwrapping
 

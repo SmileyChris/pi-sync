@@ -11,7 +11,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { peerHost } from "./lib";
 import { state, REFRESH_ICON_DURATION_MS } from "./state";
 
 export function getSyncLabel(): string {

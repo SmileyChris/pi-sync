@@ -27,6 +27,7 @@ export interface PiConfigDocument {
   extensions: Record<string, SyncedFile>;
   skills: Record<string, SyncedFile>;
   prompts: Record<string, SyncedFile>;
+  /** Legacy migration field; live session payloads use HTTP, not CRDT. */
   sessions: Record<string, SyncedFile>;
   /** Shared mesh peer roster — key is hostname (not host:port).
    *  Peers auto-write themselves on connect; all peers sync this. */
@@ -38,6 +39,8 @@ export interface PiConfigDocument {
 export interface SyncConfig {
   port: number;
   peers: string[];
+  /** Real peer hostname → configured DNS name/alias. */
+  peerAliases: Record<string, string>;
   syncSettings: boolean;
   syncExtensions: boolean;
   syncSkills: boolean;

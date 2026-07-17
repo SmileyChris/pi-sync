@@ -1,15 +1,16 @@
 # pi-sync — Protocol & Architecture
 
 Canonical reference for the pi-sync protocol, data model, and trust assumptions.
-Last updated: 2026-06-17.
+Last updated: 2026-07-17.
 
 ---
 
 ## Overview
 
 pi-sync keeps your pi coding agent setup — settings, models, extensions, skills,
-prompts, and session history — in sync across your own machines. It's a
-local-first, P2P sync extension backed by Automerge CRDTs.
+prompts, and session history — in sync across your own machines. Configuration
+state uses Automerge CRDTs; append-only session files use a bounded HTTP push
+channel on the same peer port.
 
 - **No central server.** Every peer runs a lightweight WebSocket server and
   dials outbound to every other peer.
@@ -64,7 +65,8 @@ interface PiConfigDocument {
   extensions: Record<string, SyncedFile>;    // extension files by key
   skills: Record<string, SyncedFile>;        // skill markdown files by key
   prompts: Record<string, SyncedFile>;       // prompt markdown/txt files by key
-  sessions: Record<string, SyncedFile>;      // session .jsonl files by key
+  sessions: Record<string, SyncedFile>;      // legacy; pruned after migration
+  knownPeers: Record<string, KnownPeer>;     // shared mesh roster
   localOnly: Record<string, string[]>;       // fileKey → allowed hosts
   lastSync: Record<string, number>;          // hostname → epoch ms
 }
@@ -93,15 +95,13 @@ extensions/<name>/index.ts     → extensions
 extensions/<name>/package.json → extensions
 skills/<name>/SKILL.md         → skills
 prompts/<name>.md              → prompts
-sessions/<host>/<cwd>/*.jsonl  → sessions
+sessions/<host>/<cwd>/*.jsonl  → HTTP session channel
 ```
 
-Session keys include the source hostname — e.g.,
+Session transport keys include the source hostname — e.g.,
 `sessions/macbook/--Users-chris--/2026-06-01.jsonl` — so remote sessions
 land in a hostname directory on every peer, clearly distinguishable from
-local sessions. The local-export guard skips sessions whose original source
-file (under the `--...--` CWD directory) still exists, preventing duplicate
-copies of our own sessions on disk.
+local sessions. They are not stored in the Automerge document.
 
 The subdirectory prefix determines the section of the document the file maps to.
 `settings.json` and `models.json` are per-key merged into their respective
@@ -109,8 +109,9 @@ document sections rather than stored as SyncedFile entries.
 
 ### Local-only
 
-Entries under `localOnly` pin specific files to specific hostnames. A file
-matching a local-only rule is never synced to other peers. The `pi-sync`
+Entries under `localOnly` pin extension, skill, or prompt paths to specific
+hostnames. Matching live content is removed from the shared document and
+disallowed hosts move materialized copies to trash. The `pi-sync`
 extension itself is always local-only (hardcoded at doc creation):
 
 ```json
@@ -121,8 +122,9 @@ extension itself is always local-only (hardcoded at doc creation):
 }
 ```
 
-The `shouldSync()` function gates all import and export paths on both the
-category toggle and the local-only check.
+Import and export paths gate on category toggles and local-only resolution.
+Applying a rule prevents future publication, but it cannot cryptographically
+erase content already present in Automerge history, storage backups, or logs.
 
 ---
 
@@ -143,9 +145,10 @@ category toggle and the local-only check.
 2. On next `/reload`, `initRepo()` finds a `doc-url` file and calls
    `repo.find(url)`.
 3. `whenReady()` resolves once the full snapshot has loaded from peers.
-4. Posts the local machine's files into the doc so peers learn about any
-   extensions/skills this machine has that they don't.
-5. One bulk export writes the merged tree to disk, then the change listener
+4. Established cluster values win conflicts; the joiner contributes only files
+   and JSON keys not already present in the document.
+5. One bulk export writes the merged tree to disk and records a local baseline,
+   then the change listener
    takes over for incremental updates.
 
 ### Unlink
@@ -214,12 +217,25 @@ has a `package.json` with dependencies but no `node_modules/`. If so, it runs
 `npm install --ignore-scripts` as a fire-and-forget background process so pi
 doesn't fail to load the extension on the next `/reload`.
 
+### Session file transport
+
+Session `.jsonl` files use `POST /session-sync`, separately from Automerge.
+Only native `sessions/--cwd--/**/*.jsonl` files are sent. Receivers require
+`sessions/<source-host>/--cwd--/**/*.jsonl` keys and never rebroadcast hostname
+directories, preventing echo loops. Identical content is ignored.
+
+Failed deliveries stay queued and retry every 15 seconds; all native session
+files are queued at startup so offline peers eventually catch up. Requests time
+out after 5 seconds and are limited to 64 MiB bodies and 32 MiB file content.
+Both sending and receiving are disabled when `syncSessions` is false.
+
 ---
 
 ## CRDT merge semantics
 
-pi-sync uses [Automerge](https://automerge.org/) v3. The single document
-approach means every peer has eventual consistency without coordination.
+pi-sync uses [Automerge](https://automerge.org/) v3 for configuration state.
+The single configuration document gives peers eventual consistency without
+coordination; session payloads use the separate transport above.
 
 ### ImmutableString
 
@@ -332,7 +348,8 @@ when peers go offline and should not crash the agent.
 
 ### WS / network patch
 
-Two monkey-patches prevent crash loops from orphaned sockets:
+Three idempotent, symbol-tagged monkey-patches prevent crash loops from
+orphaned sockets without stacking across jiti reloads:
 
 1. **net.Socket.prototype.connect** — adds a no-op error listener to sockets
    targeting known pi-sync peers, so orphaned TCP connections that time out
@@ -340,6 +357,8 @@ Two monkey-patches prevent crash loops from orphaned sockets:
 2. **ws.WebSocket.prototype.close** — adds a no-op error listener before
    closing CONNECTING sockets, preventing `WebSocket was closed before the
    connection was established` crashes during adapter reconnect.
+3. **WebSocketClientAdapter.prototype.connect** — closes and guards the prior
+   socket before reconnecting so it cannot become an unobserved orphan.
 
 ### Storage quarantine
 
@@ -366,8 +385,8 @@ multiple concurrent pi sessions.
   accidental cluster-wide data loss.
 - **Cluster liveness.** Crash guard, network error suppression, and standby
   watchdog keep the sync layer alive despite Automerge panics and peer churn.
-- **Machine isolation.** Local-only entries keep machine-specific files
-  (auth, caches) from leaking to peers.
+- **Machine isolation.** Built-in exclusions and local-only rules prevent
+  future publication of machine-specific extension, skill, and prompt content.
 
 ### What pi-sync does NOT protect (declared honestly)
 
@@ -382,6 +401,8 @@ multiple concurrent pi sessions.
   same user.
 - **No data-at-rest encryption.** The Automerge storage at `~/.pi/am-storage/`
   is plain files on disk. Full-disk encryption (FileVault, LUKS) is recommended.
+- **Local-only is not retroactive erasure.** Content shared before a rule was
+  applied may remain in Automerge history, old storage, or backups.
 
 ### Threat model
 
@@ -406,6 +427,7 @@ multiple concurrent pi sessions.
 | Port conflict (`EADDRINUSE`) | WS server logs error. User must edit `config.json` to change port and `/reload` |
 | Automerge wasm panic | Storage quarantined; user notified; `/reload` re-inits from peers |
 | `rm -rf ~/.pi/agent/extensions` | Mass-delete brake triggers; no tombstones created; user warned |
+| Fresh machine joins an existing document | Existing cluster values win; only new local keys are contributed |
 | Tailscale not installed | `/sync:peers scan` fails gracefully with a message about the missing CLI |
 | `/new` during async init | `initInProgress` flag blocks re-entry into `initRepo()` |
 | Multiple pi instances (standby) | Standby watchdog ensures exactly one active sync node per machine |
@@ -435,6 +457,7 @@ multiple concurrent pi sessions.
 | Path | Purpose |
 |---|---|
 | `~/.config/pi-sync/doc-url` | Automerge document URL (join key) |
+| `~/.config/pi-sync/local-baseline.json` | Keys previously materialized from this document on this host |
 | `~/.config/pi-sync/disabled` | Presence of this file disables pi-sync entirely |
 
 ### Environment variable

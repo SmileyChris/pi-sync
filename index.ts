@@ -84,7 +84,6 @@ import {
   isTombstone,
   isPastTTL,
   partitionPendingChanges,
-  effectivePeers,
   computeMeshPeerHosts,
 } from "./lib";
 import type { KnownPeer } from "./lib";
@@ -1981,7 +1980,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (action === "add" && target) {
-        if (!target.includes(":")) {
+        if (!parsePeer(target)) {
           ctx.ui.notify("Format: \`host:port\` (e.g. \`laptop.tailnet.ts.net:3030\`)", "error");
           return;
         }

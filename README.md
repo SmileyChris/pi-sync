@@ -7,10 +7,10 @@ parts of your setup that are useful to keep consistent, such as settings,
 models, prompts, skills, extensions, and session history, while leaving
 machine-specific files like auth, caches, and peer config alone.
 
-It uses Automerge CRDTs over WebSocket in a full-mesh topology — every peer
-connects to every other. Peers can edit independently and merge when they
-reconnect. No central server, no primary node. Typically run across machines
-on the same Tailscale tailnet.
+It uses Automerge CRDTs over WebSocket for configuration and a bounded HTTP
+push channel for hostname-namespaced session files. Peers form a full mesh,
+can edit independently, and reconcile when they reconnect. No central server,
+no primary node. Typically run across machines on the same Tailscale tailnet.
 
 ### What syncs
 
