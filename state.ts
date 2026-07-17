@@ -74,6 +74,10 @@ export type SyncState = {
   // Updated at init and whenever the doc's knownPeers changes.
   // Footer and /sync:status read this to show the full mesh roster.
   meshPeerHosts: Set<string>;
+  /** Current host:port targets consulted by the process-wide net patch. */
+  networkPeerTargets: Set<string>;
+  /** Last emission time for noisy rate-limited debug messages. */
+  debugLogLastAt: Map<string, number>;
 };
 
 const STATE_KEY = Symbol.for("pi-sync:state");
@@ -113,8 +117,12 @@ export const state: SyncState = ((globalThis as StateHost)[STATE_KEY] ??= ({
   installRunning: false,
   peersAtInit: [],
   meshPeerHosts: new Set(),
+  networkPeerTargets: new Set(),
+  debugLogLastAt: new Map(),
 })); // not sealed — allows schema migration across reloads
 
 // The singleton survives jiti reloads, so initialize fields introduced by a
 // newer extension version when an older state object is already resident.
 state.sessionBroadcastRunning ??= false;
+state.networkPeerTargets ??= new Set();
+state.debugLogLastAt ??= new Map();

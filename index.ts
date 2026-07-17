@@ -89,13 +89,30 @@ import {
 } from "./lib";
 import type { KnownPeer } from "./lib";
 
+const DEBUG_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
 function debugLog(msg: string) {
   const ts = new Date().toISOString();
   const line = `[${ts}] ${msg}\n`;
   try {
     ensureDir(STATE_DIR);
+    try {
+      if (fs.statSync(DEBUG_LOG).size >= DEBUG_LOG_MAX_BYTES) {
+        const rotated = `${DEBUG_LOG}.1`;
+        try { fs.rmSync(rotated, { force: true }); } catch {}
+        fs.renameSync(DEBUG_LOG, rotated);
+      }
+    } catch {}
     fs.appendFileSync(DEBUG_LOG, line);
   } catch {}
+}
+
+function debugLogRateLimited(key: string, msg: string, intervalMs = 60_000) {
+  const now = Date.now();
+  const last = state.debugLogLastAt.get(key) ?? 0;
+  if (now - last < intervalMs) return;
+  state.debugLogLastAt.set(key, now);
+  debugLog(msg);
 }
 
 /** Log to debug file AND show a TUI notification if a session is active.
@@ -1173,36 +1190,35 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
   // orphaned TCP connection eventually times out (~2 min) and with
   // no listeners, Node.js throws uncaughtException.
   const _netModule = await import("node:net");
-  const _origSocketConnect = _netModule.Socket.prototype.connect;
-  const _peerTargets = new Set(state.config.peers.map((p) => {
+  state.networkPeerTargets = new Set(state.config.peers.map((p) => {
     const parsed = parsePeer(p);
     const host = parsed?.host ?? peerHost(p);
     const port = parsed?.port ?? state.config.port;
     return `${host}:${port}`;
   }));
-  _netModule.Socket.prototype.connect = function (this: any, ...args: any[]) {
-    // Node.js internals can pass a pre-normalized arguments array as args[0]
-    let normalizedArgs = args;
-    if (args.length === 1 && Array.isArray(args[0])) {
-      normalizedArgs = args[0];
-    }
-    const opts = typeof normalizedArgs[0] === "object" ? normalizedArgs[0] : null;
-    let port = opts?.port ?? normalizedArgs[0];
-    let host = opts?.host ?? normalizedArgs[1];
-    // net.connect(options) stores host/port on the Socket and calls
-    // connect() with no args — check this.host / this.port too.
-    if (!host && this.host) host = this.host;
-    if (!port && this.port) port = this.port;
-    if (typeof host === "string" && port !== undefined) {
-      const numericPort = Number(port);
-      const targetKey = `${host}:${numericPort}`;
-      if (_peerTargets.has(targetKey)) {
-        debugLog(`net-patch: adding error listener for ${host}:${port}`);
-        this.on("error", () => {});
+  const netPatchMark = Symbol.for("pi-sync:net-connect-patch");
+  if (!(_netModule.Socket.prototype.connect as any)[netPatchMark]) {
+    const originalSocketConnect = _netModule.Socket.prototype.connect;
+    const patchedSocketConnect = function (this: any, ...args: any[]) {
+      // Node.js internals can pass a pre-normalized arguments array as args[0]
+      let normalizedArgs = args;
+      if (args.length === 1 && Array.isArray(args[0])) normalizedArgs = args[0];
+      const opts = typeof normalizedArgs[0] === "object" ? normalizedArgs[0] : null;
+      let port = opts?.port ?? normalizedArgs[0];
+      let host = opts?.host ?? normalizedArgs[1];
+      if (!host && this.host) host = this.host;
+      if (!port && this.port) port = this.port;
+      if (typeof host === "string" && port !== undefined) {
+        const targetKey = `${host}:${Number(port)}`;
+        if (state.networkPeerTargets.has(targetKey) && this.listenerCount("error") === 0) {
+          this.on("error", () => {});
+        }
       }
-    }
-    return _origSocketConnect.apply(this, args as any);
-  };
+      return originalSocketConnect.apply(this, args as any);
+    };
+    Object.defineProperty(patchedSocketConnect, netPatchMark, { value: true });
+    _netModule.Socket.prototype.connect = patchedSocketConnect as typeof originalSocketConnect;
+  }
 
   // Patch ws WebSocket.prototype.close to prevent uncaught exceptions
   // when closing a CONNECTING socket. The adapter's disconnect() removes
@@ -1211,16 +1227,20 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
   // connection is aborted. With no listener, Node.js throws uncaught.
   // We add a no-op error listener before close() so the async error has
   // somewhere to go.
-  // Apply ws prototype patch before any adapters are created
-  debugLog(`initRepo: applying ws prototype close patch`);
-  const _origWsClose = WS.prototype.close;
-  WS.prototype.close = function (this: any, code?: number, reason?: Buffer) {
-    if (this.readyState === WS.CONNECTING && this.listenerCount("error") === 0) {
-      debugLog(`ws-close-patch: CONNECTING socket, 0 error listeners — adding no-op`);
-      this.on("error", () => {});
-    }
-    return _origWsClose.call(this, code, reason);
-  };
+  // Apply ws prototype patch before any adapters are created. Symbol markers
+  // keep jiti reloads from wrapping process-wide prototypes repeatedly.
+  const wsPatchMark = Symbol.for("pi-sync:ws-close-patch");
+  if (!(WS.prototype.close as any)[wsPatchMark]) {
+    const originalWsClose = WS.prototype.close;
+    const patchedWsClose = function (this: any, code?: number, reason?: Buffer) {
+      if (this.readyState === WS.CONNECTING && this.listenerCount("error") === 0) {
+        this.on("error", () => {});
+      }
+      return originalWsClose.call(this, code, reason);
+    };
+    Object.defineProperty(patchedWsClose, wsPatchMark, { value: true });
+    WS.prototype.close = patchedWsClose;
+  }
 
   // Store for use in importFile/exportFile
   state.ImmutableString = IS;
@@ -1229,19 +1249,23 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
 
   // Patch WebSocketClientAdapter.prototype.connect to close the old socket
   // and add a no-op error listener to it before it gets orphaned on reconnect.
-  const _origAdapterConnect = WebSocketClientAdapter.prototype.connect;
-  WebSocketClientAdapter.prototype.connect = function (this: any, peerId: any, peerMetadata: any) {
-    if (this.socket) {
-      debugLog(`adapter-connect-patch: closing old socket for ${this.url}`);
-      try {
-        this.socket.addEventListener("error", () => {});
-        this.socket.close();
-      } catch (err: any) {
-        debugLog(`adapter-connect-patch: failed to close old socket: ${err?.message ?? err}`);
+  const adapterPatchMark = Symbol.for("pi-sync:adapter-connect-patch");
+  if (!(WebSocketClientAdapter.prototype.connect as any)[adapterPatchMark]) {
+    const originalAdapterConnect = WebSocketClientAdapter.prototype.connect;
+    const patchedAdapterConnect = function (this: any, peerId: any, peerMetadata: any) {
+      if (this.socket) {
+        try {
+          this.socket.addEventListener("error", () => {});
+          this.socket.close();
+        } catch (err: any) {
+          debugLog(`adapter reconnect cleanup failed: ${err?.message ?? err}`);
+        }
       }
-    }
-    return _origAdapterConnect.call(this, peerId, peerMetadata);
-  };
+      return originalAdapterConnect.call(this, peerId, peerMetadata);
+    };
+    Object.defineProperty(patchedAdapterConnect, adapterPatchMark, { value: true });
+    WebSocketClientAdapter.prototype.connect = patchedAdapterConnect;
+  }
 
   // ── HTTP server (routes WS upgrades + session sync) ───────────────
   // Share one TCP port: Automerge WebSocket on the default path,
@@ -1599,7 +1623,8 @@ async function watchAndTakeOver(pi: ExtensionAPI, saveConfig: () => void = () =>
       );
       return;
     }
-    debugLog(
+    debugLogRateLimited(
+      "standby-port-owned",
       `Another instance took port ${state.config.port} — resuming standby`,
     );
     watchAndTakeOver(pi, saveConfig).catch((e: any) =>
