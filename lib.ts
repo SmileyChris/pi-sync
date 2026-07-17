@@ -166,13 +166,12 @@ export function isSupportedFileKey(fileKey: string): boolean {
  * more hosts but does not include activeHost. Empty array = local-only
  * for everyone.
  */
-export function isLocalOnlyByMap(
+export function localOnlyHostsForKey(
   localOnly: Record<string, string[]>,
   fileKey: string,
-  activeHost: string,
-): boolean {
+): string[] | undefined {
   const key = normalizeFileKey(fileKey);
-  if (!key) return true;
+  if (!key) return [];
   let allowed: string[] | undefined;
   let matchedLength = -1;
   for (const [rawEntry, hosts] of Object.entries(localOnly)) {
@@ -184,6 +183,15 @@ export function isLocalOnlyByMap(
       matchedLength = entry.length;
     }
   }
+  return allowed;
+}
+
+export function isLocalOnlyByMap(
+  localOnly: Record<string, string[]>,
+  fileKey: string,
+  activeHost: string,
+): boolean {
+  const allowed = localOnlyHostsForKey(localOnly, fileKey);
   if (!allowed) return false;
   return !allowed.includes(activeHost);
 }

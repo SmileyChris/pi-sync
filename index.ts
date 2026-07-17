@@ -63,6 +63,7 @@ import {
   fileKey as toFileKey,
   getSubdir,
   isLocalOnly,
+  localOnlyHostsForKey,
   shouldSync,
   applyJsonMergeInPlace,
   applyJsonAdditionsInPlace,
@@ -345,6 +346,7 @@ function restoreFromTrash(fileKey: string): boolean {
   if (!fs.existsSync(src)) return false;
   const dest = piPathForKey(fileKey);
   if (!dest) return false;
+  if (fs.existsSync(dest)) return false;
   ensureDir(path.dirname(dest));
   fs.renameSync(src, dest);
   return true;
@@ -406,7 +408,7 @@ function trackedKeysForHost(doc: PiConfigDocument): string[] {
       if (
         !isTombstone(entry) &&
         shouldSync(key, state.config) &&
-        !isLocalOnly(doc, key, hostname)
+        !localOnlyHostsForKey(doc.localOnly, key)
       ) keys.push(key);
     }
   }
@@ -434,7 +436,10 @@ function importFile(
   const subdir = getSubdir(key);
   if (!subdir) return false;
   if (!shouldSync(key, state.config)) return false;
-  if (isLocalOnly(doc, key, hostname)) return false;
+  // A local-only rule means content must not enter the shared Automerge
+  // document, even on an allowed host. The allowlist controls which hosts may
+  // retain a materialized disk copy, not who receives the shared document.
+  if (localOnlyHostsForKey(doc.localOnly, key)) return false;
 
   const absPath = subdir === "sessions"
     ? sessionImportPath(key)
@@ -508,12 +513,41 @@ function importAllFiles(
   return changed;
 }
 
+function enforceLocalOnlyOnDisk(doc: PiConfigDocument) {
+  for (const key of collectAllFiles()) {
+    const allowedHosts = localOnlyHostsForKey(doc.localOnly, key);
+    if (!allowedHosts) continue;
+    if (allowedHosts.includes(hostname)) restoreFromTrash(key);
+    else moveToTrash(key);
+  }
+}
+
+function removeLocalOnlyContentFromDoc(doc: PiConfigDocument): number {
+  let removed = 0;
+  for (const section of ["extensions", "skills", "prompts"] as const) {
+    const collection = doc[section] as Record<string, SyncedFile>;
+    for (const key of Object.keys(collection ?? {})) {
+      if (localOnlyHostsForKey(doc.localOnly ?? {}, key)) {
+        delete collection[key];
+        removed++;
+      }
+    }
+  }
+  return removed;
+}
+
 // ── Export: document → filesystem ─────────────────────────────────────
 
 function exportFile(doc: PiConfigDocument, fileKey: string): boolean {
   const key = normalizeFileKey(fileKey);
   if (!key) return false;
-  if (isLocalOnly(doc, key, hostname)) return false;
+  const localOnlyHosts = localOnlyHostsForKey(doc.localOnly, key);
+  if (localOnlyHosts) {
+    if (localOnlyHosts.includes(hostname)) {
+      return restoreFromTrash(key);
+    }
+    return moveToTrash(key);
+  }
   const subdir = getSubdir(key);
   if (!subdir) return false;
   if (!shouldSync(key, state.config)) return false;
@@ -1397,8 +1431,9 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     const doc = payload?.doc;
     if (!doc) return;
     if (state.suppressExportDepth > 0) return;
-    if (isDocEmpty(doc)) return;
     const patches: any[] = payload?.patches ?? [];
+    const localOnlyChanged = patches.some((p: any) => p.path[0] === "localOnly");
+    if (isDocEmpty(doc) && !localOnlyChanged) return;
 
     // If knownPeers changed, refresh the mesh roster cache
     if (patches.length === 0 || patches.some((p: any) => p.path[0] === "knownPeers")) {
@@ -1410,6 +1445,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     if (patches.length === 0) {
       state.recentRemoteChanges = [];
       exportAllFiles(doc);
+      enforceLocalOnlyOnDisk(doc);
       return;
     }
     const dirty = dirtyKeysFromPatches(patches);
@@ -1424,6 +1460,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
       }
     }
     exportKeys(doc, dirty);
+    if (localOnlyChanged) enforceLocalOnlyOnDisk(doc);
   });
 
   if (docUrl) {
@@ -1437,6 +1474,9 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
     // ── Create path: synchronous (fast — no WASM deserialization) ──
     state.handle.change?.((doc: PiConfigDocument) => {
       if (!doc.knownPeers) doc.knownPeers = {};
+      if (!doc.localOnly) doc.localOnly = {};
+      const removed = removeLocalOnlyContentFromDoc(doc);
+      if (removed > 0) debugLog(`initRepo: removed ${removed} local-only entries from shared document`);
     });
     // No whenReady needed for newly created docs — already ready.
     // But call it for consistency; resolves immediately.
@@ -1453,6 +1493,7 @@ async function initRepo(pi: ExtensionAPI, saveConfig: () => void = () => {}): Pr
       if (!isDocEmpty(createdDoc)) {
         exportAllFiles(createdDoc);
       }
+      enforceLocalOnlyOnDisk(createdDoc);
       saveLocalBaseline(createdDoc, state.handle.url);
     }
     state.initialSyncReady = true;
@@ -1617,6 +1658,9 @@ async function completeDocSetup(
     // KnownPeers migration (safe now — handle is ready)
     state.handle.change?.((doc: PiConfigDocument) => {
       if (!doc.knownPeers) doc.knownPeers = {};
+      if (!doc.localOnly) doc.localOnly = {};
+      const removed = removeLocalOnlyContentFromDoc(doc);
+      if (removed > 0) debugLog(`completeDocSetup: removed ${removed} local-only entries from shared document`);
     });
 
     const readyDoc = await state.handle.doc?.();
@@ -1718,6 +1762,7 @@ async function completeDocSetup(
       if (!isDocEmpty(mergedDoc)) {
         exportAllFiles(mergedDoc);
       }
+      enforceLocalOnlyOnDisk(mergedDoc);
       saveLocalBaseline(mergedDoc, documentUrl);
       debugLog(`completeDocSetup: ${firstJoin ? "first join" : "restart"} merge completed`);
     }
@@ -2354,6 +2399,11 @@ export default function (pi: ExtensionAPI) {
       const parts = (args ?? "").trim().split(/\s+/);
       const action = parts[0];
       const fileArg = parts[1] ? normalizeFileKey(parts[1]) : null;
+      const localOnlySection = fileArg ? getSubdir(fileArg) : null;
+      const isLocalOnlyCollection =
+        localOnlySection === "extensions" ||
+        localOnlySection === "skills" ||
+        localOnlySection === "prompts";
 
       if (action === "list" || !action) {
         const entries = Object.entries(doc.localOnly as Record<string, string[]>);
@@ -2367,20 +2417,39 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (action === "add" && fileArg) {
+        if (!isLocalOnlyCollection) {
+          ctx.ui.notify("Local-only rules support extension, skill, and prompt paths.", "error");
+          return;
+        }
         const targetHost = parts[2] || hostname;
         state.handle.change?.((d: PiConfigDocument) => {
           if (!d.localOnly[fileArg]) d.localOnly[fileArg] = [];
           if (!d.localOnly[fileArg].includes(targetHost)) {
             d.localOnly[fileArg].push(targetHost);
           }
+          // Remove current content from the shared document. Future imports are
+          // blocked while the local-only rule exists.
+          for (const section of ["extensions", "skills", "prompts"] as const) {
+            const collection = d[section] as Record<string, SyncedFile>;
+            for (const key of Object.keys(collection)) {
+              if (key === fileArg || key.startsWith(`${fileArg}/`)) delete collection[key];
+            }
+          }
         });
-        ctx.ui.notify(`Marked \`${fileArg}\` as local-only for \`${targetHost}\``, "info");
+        ctx.ui.notify(
+          `Marked \`${fileArg}\` as local-only for \`${targetHost}\`. ` +
+          "Its current content was removed from the shared document.",
+          "info",
+        );
         return;
       }
 
       if (action === "remove" && fileArg) {
         state.handle.change?.((d: PiConfigDocument) => {
           delete d.localOnly[fileArg];
+          for (const key of collectAllFiles()) {
+            if (key === fileArg || key.startsWith(`${fileArg}/`)) importFile(d, key);
+          }
         });
         ctx.ui.notify(`Removed local-only from \`${fileArg}\``, "info");
         return;

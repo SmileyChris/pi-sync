@@ -16,6 +16,7 @@ import {
   fileKey,
   getSubdir,
   isSupportedFileKey,
+  localOnlyHostsForKey,
   isLocalOnlyByMap,
   isLocalOnly,
   shouldSync,
@@ -201,6 +202,12 @@ describe("isLocalOnlyByMap", () => {
     };
     expect(isLocalOnlyByMap(map, "extensions/foo/private/index.ts", hostB)).toBe(true);
     expect(isLocalOnlyByMap(map, "extensions/foo/public/index.ts", hostB)).toBe(false);
+    expect(localOnlyHostsForKey(map, "extensions/foo/public/index.ts")).toEqual([hostB]);
+  });
+
+  it("exposes whether a matching rule exists even on an allowed host", () => {
+    expect(localOnlyHostsForKey(localOnly, "skills/secret/SKILL.md")).toEqual([hostA, hostB]);
+    expect(localOnlyHostsForKey(localOnly, "skills/public/SKILL.md")).toBeUndefined();
   });
 
   it("treats unsafe keys as local-only", () => {
